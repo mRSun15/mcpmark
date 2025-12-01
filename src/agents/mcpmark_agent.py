@@ -16,7 +16,8 @@ import nest_asyncio
 
 from src.logger import get_logger
 from .base_agent import BaseMCPAgent
-from .mcp import MCPStdioServer, MCPHttpServer
+from .mcp import MCPStdioServer, MCPHttpServer, MCPRestClient
+from .openai_client import SimpleOpenAIClient
 
 # Apply nested asyncio support
 nest_asyncio.apply()
@@ -28,17 +29,78 @@ logger = get_logger(__name__)
 
 class MCPMarkAgent(BaseMCPAgent):
     """
-    Unified agent for LLM and MCP server management using LiteLLM.
+    Unified agent for LLM and MCP server management.
 
-    - Anthropic models: Native MCP support via extra_body
-    - Other models: Manual MCP server management with function calling
+    - Claude models: Use LiteLLM
+    - OpenAI models: Use direct OpenAI client for better performance
     """
 
     MAX_TURNS = 100
     SYSTEM_PROMPT = (
         "You are a helpful agent that uses tools iteratively to complete the user's task, "
-        "and when finished, provides the final answer or simply states \"Task completed\" without further tool calls."
+        "and when finished, provides the final answer or simply states \"Task completed\" without further tool calls. CRITICAL RULES: "
+        "1. you should strictly follow the user's instructions, no extra inference or reasoning unless it is explicitly requested; "
+        "2. memory is a compression summary of what you have done, key facts and taks plan, you may reference it for next tool calls. "
+        "If memory contains VERIFIED CONSTRAINTS section, you MUST check it before each tool call and avoid violating those specific constraints. "
+        "3. there may be typos in the task description, use your judgment to infer the correct names/terms when possible; "
+        "4. for time related tasks, if not specified, please use the time zone of GMT+0800 (China Standard Time). "
+        "5. use code to solve problem if possible. "
+        "6. Avoid unnecessary redundantly calling the same tool with identical arguments."
     )
+    MEMORY_SYSTEM_PROMPT = (
+        "You own the shared task memory—call update_memory to keep it accurate. "
+        "Treat this memory as a compressed snapshot of everything the agent has done and still needs to do. "
+        "Use the prior memory plus the newest tool outputs; you may apply straightforward logical implications, but never invent facts that are not supported by tools or logic, and structure the update exactly as follows:\n"
+        "\n"
+        "**OVERVIEW**\n"
+        "- 1–2 sentences describing the current situation and goal.\n"
+        "\n"
+        "**TASK PLAN**\n"
+        "- Bullet list of the current plan or next steps; reorder or edit as understanding changes.\n"
+        "- Ensure the plan is directly aligned with the user's instructions—do not add steps or goals not requested.\n"
+        "\n"
+        "**PROGRESS & GAPS**\n"
+        "- Bullet list of work finished, outstanding items, and explicit blockers.\n"
+        "\n"
+        "**PERSISTENT FACTS**\n"
+        "- Bullet list for persistent metrics/identifiers (counts, aggregates, paths, key entities) related to the task.\n"
+        "- Wherever possible, store concrete values (exact IDs, directory paths, thresholds), don't use general or vague values. (if it's an tree/list, store the details of each item if possible)\n"
+        "- Only change items here when a tool result or clear logic definitively updates them; otherwise carry them forward.\n"
+        "- The FACTS should be CONCRETE, CORRECT and NOT CONTRADICTORY to each others. "
+        "\n"
+        "**CONSTRAINTS**\n"
+        "- Bullet list of key task requirements, guardrails, and rules that must remain in force throughout execution.\n"
+        "- Keep these bullets even when no new data arrives, updating them only when tools or logic clearly require it.\n"
+        "\n"
+        "**VERIFIED CONSTRAINTS** (if present in prior memory)\n"
+        "- If the prior memory contains a VERIFIED CONSTRAINTS section, carry it forward EXACTLY as-is. Never modify or remove items from this section.\n"
+        "- This section contains specific constraints/issues (with concrete names/paths/IDs) discovered during verification that must persist and should not be violated.\n"
+        "\n"
+        "Rules: keep the memory concise yet precise, cite only tool-backed information or direct logical consequences, assume GMT+08:00 (China Standard Time) for unspecified timestamps, and if nothing new was learned leave the memory unchanged."
+    )
+    VERIFICATION_SYSTEM_PROMPT = (
+        "You are a verification agent responsible for validating the newly generated memory report based on the latest tool calls. Check:\n"
+        "\n"
+        "1. **COMPLETENESS**: Verify all key requirements and tasks instructions are captured, flag missing aspects.\n"
+        "\n"
+        "2. **SPECIFICITY**: Ensure concrete details (names, paths, values) match task requirements, not generic placeholders.\n"
+        "\n"
+        "3. **CORRECNESS**: Verify facts are accurate, consistent and supported by tool results. No fabricated or contradictory information."
+        "\n"
+        "4. **LOGICAL CONSISTENCY**: Sections align—TASK PLAN matches OVERVIEW; PROGRESS & GAPS doesn't contradict PERSISTENT FACTS; CONSTRAINTS are compatible with the plan.\n"
+        "\n"
+        "5. **REASONING CORRECTNESS**: Logical inferences are valid. No fabricated assumptions. Cause-effect relationships make sense.\n"
+        "\n"
+        "6. **FORMAT & CLARITY**: Confirm the propoer structure (OVERVIEW, TASK PLAN, PROGRESS & GAPS, PERSISTENT FACTS, CONSTRAINTS, VERIFIED CONSTRAINTS if present)"
+        "\n"
+        "6. **VERIFIED CONSTRAINTS MANAGEMENT**: When you discover errors from above analysis, add them to the VERIFIED CONSTRAINTS section:\n"
+        "   - If it doesn't exist (first verification issue discovered), create the section in the memory\n"
+        "   - CRITICAL: Constraints must be SPECIFIC and CONCRETE with actual entity names, paths, IDs, values from the error\n"
+        "\n"
+        "Call verify_memory with your analysis. If issues are found, provide a corrected version. "
+        "If no issue observed, return it unchanged but acknowledge its validity."
+    )
+    ACTION_SYSTEM_PROMPT = SYSTEM_PROMPT
     DEFAULT_TIMEOUT = BaseMCPAgent.DEFAULT_TIMEOUT
 
     def __init__(
@@ -62,13 +124,29 @@ class MCPMarkAgent(BaseMCPAgent):
             service_config_provider=service_config_provider,
             reasoning_effort=reasoning_effort,
         )
+        
+        # Initialize OpenAI client for non-Claude models
+        logger.info("self.is_claude: %s", self.is_claude)        
+        model_name = litellm_input_model_name.split("/", 1)[1] if "/" in litellm_input_model_name else litellm_input_model_name
+        logger.info(f"Initializing OpenAI client for model: {model_name}")
+        # self._openai_client = SimpleOpenAIClient(
+        #     model=model_name,
+        #     api_key=api_key,
+        #     base_url=base_url,
+        #     reasoning_effort=reasoning_effort or "default",
+        # )
+        self._openai_client = None
+        
+        # Memory management configuration
+        self.memory_update_threshold = self.service_config.get("memory_update_threshold", 8)
+        logger.info(f"Memory update threshold: {self.memory_update_threshold} tool calls")
+        
         logger.debug(
-            "Initialized MCPMarkAgent for '%s' with model '%s' (Claude: %s, Thinking: %s, Reasoning: %s)",
+            "Initialized MCPMarkAgent for '%s' with model '%s' (Claude: %s, OpenAI Client: %s)",
             mcp_service,
             litellm_input_model_name,
             self.is_claude,
-            self.use_claude_thinking,
-            reasoning_effort,
+            self._openai_client is not None,
         )
 
     # ==================== Public Interface Methods ====================
@@ -525,15 +603,800 @@ class MCPMarkAgent(BaseMCPAgent):
                 functions = self._convert_to_openai_format(tools)
                 
                 # Execute with function calling loop
-                return await self._execute_litellm_tool_loop(
+                return await self._execute_two_phase_tool_loop(
                     instruction, functions, mcp_server, tool_call_log_file
                 )
+                # return await self._execute_litellm_tool_loop(
+                #     instruction, functions, mcp_server, tool_call_log_file
+                # )
                 
         except Exception as e:
             logger.error(f"Manual MCP execution failed: {e}")
             raise
         
+    
+    def _create_update_memory_tool(self) -> Dict:
+        """Create the shared memory update tool"""
+        return {
+            "name": "update_memory",
+            "description": (
+                "Update the shared task memory using the latest tool results. "
+                "The string you return must follow the OVERVIEW / TASK PLAN / PROGRESS & GAPS / PERSISTENT FACTS / CONSTRAINTS / VERIFIED CONSTRAINTS(optional) layout "
+                "and only include information directly supported by tool outputs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "report": {
+                        "type": "string",
+                        "description": (
+                            "A concise memory update covering the required sections."
+                        )
+                    }
+                },
+                "required": ["report"]
+            }
+        }
+    
+    def _create_verify_memory_tool(self) -> Dict:
+        """Create the memory verification tool"""
+        return {
+            "name": "verify_memory",
+            "description": (
+                "Verify and potentially correct the generated memory report. "
+                "Check for correctness of facts, logical consistency, completeness, reasoning validity, and format. "
+                "Return the verified(corrected if needed) memory."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "verified_report": {
+                        "type": "string",
+                        "description": (
+                            "The verified and potentially corrected memory report following the same structure."
+                        )
+                    },
+                    "issues_found": {
+                        "type": "string",
+                        "description": (
+                            "Brief description of any issues found and corrections made, or 'None' if memory was correct."
+                        )
+                    }
+                },
+                "required": ["verified_report", "issues_found"]
+            }
+        }
+    
+    def _build_messages_with_context(
+        self,
+        instruction: str,
+        latest_memory: str = "",
+        last_tool_contexts: Optional[List[Dict[str, Any]]] = None,
+        mode: str = "action",
+        tool_history: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Build message list with proper roles: user, assistant (memory), tool (result)"""
+        memory_text = latest_memory or "none"
+        
+        if mode == "report":
+            messages = [
+                {"role": "system", "content": self.MEMORY_SYSTEM_PROMPT},
+                {"role": "user", "content": instruction},
+                {"role": "user", "content": "update the shared memory to reflect the latest tool results and adjust the plan accordingly."},
+            ]
+        elif mode == "verify":
+            messages = [
+                {"role": "system", "content": self.VERIFICATION_SYSTEM_PROMPT},
+                {"role": "user", "content": f"Original Task: {instruction}"},
+            ]
+        else:  # action
+            messages = [
+                {"role": "system", "content": self.ACTION_SYSTEM_PROMPT},
+                {"role": "user", "content": instruction},
+            ]
+        
+        def _append_tool_call(ctx: Dict[str, Any]) -> None:
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": ctx["id"],
+                            "type": "function",
+                            "function": {
+                                "name": ctx["name"],
+                                "arguments": ctx.get("arguments", "{}")
+                            }
+                        }
+                    ]
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": ctx["id"],
+                    "content": ctx.get("formatted_result") or str(ctx["result"])
+                })
+        if mode == "action" and tool_history:
+            for ctx in tool_history:
+                _append_tool_call(ctx)
+        elif mode == "report" and last_tool_contexts:
+            for ctx in last_tool_contexts:
+                _append_tool_call(ctx)
+        elif mode == "verify" and last_tool_contexts:
+            for ctx in last_tool_contexts:
+                _append_tool_call(ctx)
 
+        if mode != "verify":
+            messages.append({
+                "role": "user",
+                "content": f"Reference memory (if any): {memory_text}"
+            })
+        else:
+            messages.append({
+                "role": "user",
+                "content": f"Generated Memory to Verify:\n{memory_text}\n"
+            })
+
+        return messages
+
+    @staticmethod
+    def _safe_json_loads(value: Any) -> Optional[Any]:
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        if not value:
+            return None
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    def _format_tool_result_for_model(self, result: Any, tool_name: str = "") -> str:
+        """
+        Convert raw MCP tool output into a JSON-friendly string for the model.
+        Attempts to strip extra wrappers (meta/content) while preserving human-readable text.
+        """
+        payload = result
+
+        parsed = self._safe_json_loads(payload) if isinstance(payload, str) else None
+        if parsed is not None:
+            payload = parsed
+        
+        if tool_name == "directory_tree":
+            # Extract the actual directory tree data from the nested structure
+            tree_data = None
+            
+            # Case 1: payload is already a list of entries
+            if isinstance(payload, list) and self._looks_like_directory_tree(payload):
+                tree_data = payload
+            # Case 2: payload has content wrapper with text field
+            elif isinstance(payload, dict):
+                content_blocks = payload.get("content")
+                if isinstance(content_blocks, list) and content_blocks:
+                    for block in content_blocks:
+                        if isinstance(block, dict) and isinstance(block.get("text"), str):
+                            text = block["text"].strip()
+                            # Try to parse the text as JSON
+                            parsed_tree = self._safe_json_loads(text)
+                            if parsed_tree and isinstance(parsed_tree, list) and self._looks_like_directory_tree(parsed_tree):
+                                tree_data = parsed_tree
+                                break
+            
+            if tree_data:
+                formatted = self._format_directory_tree(tree_data)
+                return formatted
+            else:
+                logger.warning("Could not extract directory tree data from payload, returning raw result")
+                # Fall through to general handling as fallback
+
+        if isinstance(payload, dict):
+            content_blocks = payload.get("content")
+            text_segments: List[str] = []
+            if isinstance(content_blocks, list):
+                for block in content_blocks:
+                    if isinstance(block, dict) and isinstance(block.get("text"), str):
+                        text = block["text"].strip()
+                        if text:
+                            text_segments.append(text)
+            if text_segments:
+                return "\n".join(text_segments)
+
+
+        if isinstance(payload, (dict, list)):
+            try:
+                return json.dumps(payload, ensure_ascii=False)
+            except (TypeError, ValueError):
+                return str(payload)
+
+        return str(payload)
+
+    @staticmethod
+    def _looks_like_directory_tree(payload: Any) -> bool:
+        if not isinstance(payload, list) or not payload:
+            return False
+        sample = payload[0]
+        return isinstance(sample, dict) and "name" in sample and "type" in sample
+
+    def _format_directory_tree(self, entries: List[Dict[str, Any]]) -> str:
+        def recurse(nodes: List[Dict[str, Any]], prefix: str, is_root: bool) -> List[str]:
+            lines: List[str] = []
+            count = len(nodes)
+            for idx, node in enumerate(nodes):
+                name = node.get("name", "unknown")
+                node_type = node.get("type", "")
+                children = node.get("children") if isinstance(node, dict) else None
+                is_dir = node_type == "directory"
+                suffix = "/" if is_dir else ""
+                is_last = idx == count - 1
+
+                if is_root:
+                    line = f"{name}{suffix}"
+                    child_prefix = "    "
+                else:
+                    connector = "└── " if is_last else "├── "
+                    line = f"{prefix}{connector}{name}{suffix}"
+                    child_prefix = prefix + ("    " if is_last else "│   ")
+
+                lines.append(line)
+                if is_dir and isinstance(children, list) and children:
+                    lines.extend(recurse(children, child_prefix, False))
+            return lines
+
+        return "\n".join(recurse(entries, "", True))
+
+
+    def _get_report_model_config(self) -> Dict[str, Optional[str]]:
+        """Return the model/api/base_url tuple for report summarization."""
+        model_name = self.service_config.get("report_model_name") or self.REPORT_MODEL_DEFAULT
+        api_key = self.service_config.get("report_model_api_key") or self.REPORT_MODEL_API_KEY_DEFAULT
+        base_url = self.service_config.get("report_model_base_url") or self.REPORT_MODEL_BASE_URL_DEFAULT
+        return {
+            "model": model_name,
+            "api_key": api_key,
+            "base_url": base_url
+        }
+
+    async def _execute_two_phase_tool_loop(
+        self,
+        instruction: str,
+        functions: List[Dict],
+        mcp_server: Any,
+        tool_call_log_file: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Execute function calling loop with LiteLLM using report-based memory compression."""
+        
+        # Prepare tool definitions
+        memory_tool_def = self._create_update_memory_tool()
+        action_tools = [{"type": "function", "function": func} for func in functions] if functions else []
+        memory_tool = {"type": "function", "function": memory_tool_def}
+        available_tools = action_tools + [memory_tool]
+
+        
+        # State tracking for report-based prompting
+        latest_memory = ""
+        tool_contexts_since_last_memory: List[Dict[str, Any]] = []  # Accumulate until memory update
+        tool_call_history: List[Dict[str, Any]] = []  # Full history for action LLM
+        
+        # Message accumulation for output (backward compatibility)
+        all_messages = []
+        
+        total_tokens = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "reasoning_tokens": 0}
+        turn_count = 0
+        max_turns = self.MAX_TURNS  # Limit turns to prevent infinite loops
+        consecutive_failures = 0
+        max_consecutive_failures = 3
+        hit_turn_limit = False
+        ended_normally = False
+
+        def _record_usage(response_obj):
+            """Accumulate token usage from a LiteLLM response."""
+            if hasattr(response_obj, 'usage') and response_obj.usage:
+                input_tokens = response_obj.usage.prompt_tokens or 0
+                total_tokens_count = response_obj.usage.total_tokens or 0
+                output_tokens = (
+                    total_tokens_count - input_tokens
+                    if total_tokens_count > 0
+                    else (response_obj.usage.completion_tokens or 0)
+                )
+                total_tokens["input_tokens"] += input_tokens
+                total_tokens["output_tokens"] += output_tokens
+                total_tokens["total_tokens"] += total_tokens_count
+                if hasattr(response_obj.usage, 'completion_tokens_details'):
+                    details = response_obj.usage.completion_tokens_details
+                    if hasattr(details, 'reasoning_tokens'):
+                        total_tokens["reasoning_tokens"] += details.reasoning_tokens or 0
+        
+        # Log available tools
+        if tool_call_log_file and available_tools:
+            max_name_length = max(
+                len(tool.get("function", {}).get("name", ""))
+                for tool in available_tools
+            )
+            with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                f.write("===== Available Tools =====\n")
+                for tool in available_tools:
+                    function_info = tool.get("function", {})
+                    tool_name = function_info.get("name", "N/A")
+                    description = function_info.get("description", "N/A")
+                    f.write(f"- ToolName: {tool_name:<{max_name_length}} Description: {description}\n")
+                f.write("\n===== Execution Logs =====\n")
+        
+        try:
+            while turn_count < max_turns:
+                # Build fresh messages with proper roles (reset each turn for compression)
+                messages = self._build_messages_with_context(
+                    instruction=instruction,
+                    latest_memory=latest_memory,
+                    mode="action",
+                    tool_history=tool_call_history,
+                )
+                
+                # Store for output (only add on first turn to avoid duplication)
+                if turn_count == 0:
+                    all_messages.append({"role": "system", "content": self.SYSTEM_PROMPT})
+                    all_messages.append({"role": "user", "content": instruction})
+                
+                # Build completion kwargs
+                completion_kwargs = {
+                    "model": self.litellm_input_model_name,
+                    "messages": messages,
+                    "api_key": self.api_key,
+                }
+                
+                # Action phase uses only action tools
+                if action_tools:
+                    completion_kwargs["tools"] = action_tools
+                    completion_kwargs["tool_choice"] = "auto"
+                
+                # Add reasoning_effort and base_url if specified
+                if self.reasoning_effort != "default":
+                    completion_kwargs["reasoning_effort"] = self.reasoning_effort
+                if self.base_url:
+                    completion_kwargs["base_url"] = self.base_url
+                
+                # DEBUG: Log what we're sending to LiteLLM
+                # logger.info(f"\n===== LITELLM CALL (Turn {turn_count + 1}) =====")
+                # logger.info(f"Tools: {len(completion_kwargs.get('tools', []))} tools available")
+                # logger.info(f"Tool choice: {completion_kwargs.get('tool_choice', 'not set')}")
+                # logger.info(f"Messages: {messages}")
+                # logger.info("===== END CALL INFO =====\n")
+                
+                try:
+                    # Call OpenAI client or LiteLLM depending on model type
+                    if self._openai_client:
+                        response = await asyncio.wait_for(
+                            self._openai_client.acompletion(
+                                messages=messages,
+                                tools=completion_kwargs.get("tools"),
+                                tool_choice=completion_kwargs.get("tool_choice"),
+                            ),
+                            timeout = self.timeout / 2
+                        )
+                    else:
+                        response = await asyncio.wait_for(
+                            litellm.acompletion(**completion_kwargs),
+                            timeout = self.timeout / 2
+                        )
+                    consecutive_failures = 0  # Reset failure counter on success
+                except asyncio.TimeoutError:
+                    logger.warning(f"| ✗ LLM call timed out on turn {turn_count + 1}")
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        raise Exception(f"Too many consecutive failures ({consecutive_failures})")
+                    await asyncio.sleep(8 ** consecutive_failures)  # Exponential backoff
+                    continue
+                except Exception as e:
+                    logger.error(f"| ✗ LLM call failed on turn {turn_count + 1}: {e}")
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        raise
+                    if "ContextWindowExceededError" in str(e):
+                        raise
+                    elif "RateLimitError" in str(e):
+                        await asyncio.sleep(12 ** consecutive_failures)
+                    else:
+                        await asyncio.sleep(2 ** consecutive_failures)
+                    continue
+                
+                # Extract actual model name from response (first turn only)
+                if turn_count == 0 and hasattr(response, 'model') and response.model:
+                    self.litellm_run_model_name = response.model.split("/")[-1]
+                
+                # Update token usage including reasoning tokens
+                _record_usage(response)
+                
+                # Get response message
+                choices = response.choices
+                if len(choices):
+                    message = choices[0].message
+                    message_dict = message.model_dump() if hasattr(message, 'model_dump') else dict(message)
+                    
+                    # DEBUG: Log what LLM returned (summary)
+                    if hasattr(message, 'tool_calls') and message.tool_calls:
+                        tool_names = [tc.function.name for tc in message.tool_calls]
+                        logger.info(f"| 🔧 LLM returned {len(message.tool_calls)} tool call(s): {tool_names}")
+                        if tool_call_log_file:
+                            with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                                f.write(f"| DEBUG: Tool calls returned: {tool_names}\n")
+                    else:
+                        finish_reason = choices[0].finish_reason if choices else 'unknown'
+                        has_content = bool(hasattr(message, 'content') and message.content)
+                        logger.info(f"| 🔧 LLM returned NO tool calls (finish_reason: {finish_reason}, has_content: {has_content})")
+                        if tool_call_log_file:
+                            with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                                f.write(f"| DEBUG: No tool calls (finish_reason: {finish_reason}, has_content: {has_content})\n")
+                    
+                # Log assistant's text content if present
+                if hasattr(message, 'content') and message.content:
+                    # Display the content with line prefix
+                    for line in message.content.splitlines():
+                        logger.info(f"| {line}")
+                    
+                    # Also log to file if specified
+                    if tool_call_log_file:
+                        with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                            f.write(f"{message.content}\n")
+                
+                # Check for tool calls (newer format)
+                if hasattr(message, 'tool_calls') and message.tool_calls:
+                    # Add assistant message to output
+                    all_messages.append(message_dict)
+                    # Process tool calls 
+                    action_tool_executed = False
+                    for tool_call in message.tool_calls:
+                        func_name = tool_call.function.name
+                        func_args = json.loads(tool_call.function.arguments)
+                        
+                        # Execute real MCP tool
+                        try:
+                            result = await asyncio.wait_for(
+                                mcp_server.call_tool(func_name, func_args),
+                                timeout=60
+                            )
+                            formatted_result = self._format_tool_result_for_model(result, func_name)
+                            # Store for memory update context (accumulate across turns)
+                            tool_contexts_since_last_memory.append({
+                                "name": func_name,
+                                "result": result,
+                                "formatted_result": formatted_result,
+                                "id": tool_call.id,
+                                "arguments": json.dumps(func_args, separators=(",", ": "))
+                            })
+                            
+                            # Add to messages for output
+                            all_messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": formatted_result
+                            })
+                        except asyncio.TimeoutError:
+                            error_msg = f"Tool call '{func_name}' timed out after 60 seconds"
+                            logger.error(error_msg)
+                            formatted_result = error_msg
+                            tool_contexts_since_last_memory.append({
+                                "name": func_name,
+                                "result": f"Error: {error_msg}",
+                                "formatted_result": formatted_result,
+                                "id": tool_call.id,
+                                "arguments": json.dumps(func_args, separators=(",", ": "))
+                            })
+                            
+                            # Add error to messages
+                            all_messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": f"Error: {error_msg}"
+                            })
+                        except Exception as e:
+                            logger.error(f"Tool call failed: {e}")
+                            formatted_result = f"Error: {str(e)}"
+                            tool_contexts_since_last_memory.append({
+                                "name": func_name,
+                                "result": f"Error: {str(e)}",
+                                "formatted_result": formatted_result,
+                                "id": tool_call.id,
+                                "arguments": json.dumps(func_args, separators=(",", ": "))
+                            })
+                            
+                            # Add error to messages
+                            all_messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": formatted_result
+                            })
+                        action_tool_executed = True
+                        tool_call_history.append(dict(tool_contexts_since_last_memory[-1]))
+                        
+                        # Format arguments for display (truncate if too long)
+                        args_str = json.dumps(func_args, separators=(",", ": "))
+                        display_arguments = args_str[:140] + "..." if len(args_str) > 140 else args_str
+                        
+                        # Log with ANSI color codes (bold tool name, dim gray arguments)
+                        logger.info(f"| \033[1m{func_name}\033[0m \033[2;37m{display_arguments}\033[0m")
+                        
+                        if tool_call_log_file:
+                            with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                                f.write(f"| {func_name} {args_str}\n")
+                                f.write(f"  Result: {formatted_result}\n")
+                
+                    # Update progress after tool results
+                    messages_for_progress = [message_dict]
+                    turn_count += 1
+                    self._update_progress(messages_for_progress, total_tokens, turn_count)
+                    
+                    # Decide if we should update memory based on accumulated tool calls
+                    should_update_memory = (
+                        action_tool_executed and (
+                            turn_count <= 3  # First 3 turns always update
+                            or len(tool_contexts_since_last_memory) >= self.memory_update_threshold
+                            or turn_count >= max_turns - 5  # Near end always update
+                        )
+                    )
+                    
+                    if should_update_memory:
+                        # Build messages with accumulated tool contexts
+                        memory_messages = self._build_messages_with_context(
+                            instruction=instruction,
+                            latest_memory=latest_memory,
+                            last_tool_contexts=tool_contexts_since_last_memory,
+                            mode="report"
+                        )
+
+                        memory_kwargs = {
+                            "model": self.litellm_input_model_name,
+                            "messages": memory_messages,
+                            "api_key": self.api_key,
+                            "tools": [memory_tool],
+                            "tool_choice": {
+                                "type": "function",
+                                "function": {"name": "update_memory"}
+                            }
+                        }
+                        
+                        if self.reasoning_effort != "default":
+                            memory_kwargs["reasoning_effort"] = self.reasoning_effort
+                        if self.base_url:
+                            memory_kwargs["base_url"] = self.base_url
+
+                        # DEBUG: Log what we're sending to LiteLLM
+                        # logger.info(f"\n===== LITELLM SUBMIT REPORT CALL (Turn {turn_count + 1}) =====")
+                        # logger.info(f"Tools: {len(report_kwargs.get('tools', []))} tools available")
+                        # logger.info(f"Tool choice: {report_kwargs.get('tool_choice', 'not set')}")
+                        # logger.info(f"Messages: {report_messages}")
+                        # logger.info("===== END CALL INFO =====\n")
+
+                        try:
+                            if self._openai_client:
+                                logger.info(f"update_memory call with OpenAI client")
+
+                                memory_response = await asyncio.wait_for(
+                                    self._openai_client.acompletion(
+                                        messages=memory_messages,
+                                        tools=memory_kwargs.get("tools"),
+                                        tool_choice=memory_kwargs.get("tool_choice"),
+                                    ),
+                                    timeout=self.timeout / 2
+                                )
+                            else:
+                                logger.info(f"📝 update_memory call ({len(tool_contexts_since_last_memory)} tool calls accumulated)")
+                                memory_response = await asyncio.wait_for(
+                                    litellm.acompletion(**memory_kwargs),
+                                    timeout=self.timeout / 2
+                                )
+                            consecutive_failures = 0
+                        except asyncio.TimeoutError:
+                            logger.warning("| ✗ Memory call timed out; continuing without updated memory")
+                            continue
+                        except Exception as e:
+                            logger.error(f"| ✗ Memory call failed: {e}")
+                            continue
+                        
+                        _record_usage(memory_response)
+                        
+                        memory_choices = memory_response.choices
+                        if not len(memory_choices):
+                            logger.error("| Memory call returned no choices")
+                            continue
+                        
+                        memory_message = memory_choices[0].message
+                        memory_message_dict = memory_message.model_dump() if hasattr(memory_message, 'model_dump') else dict(memory_message)
+                        
+                        if not hasattr(memory_message, 'tool_calls') or not memory_message.tool_calls:
+                            logger.error("| Memory call did not return update_memory tool call")
+                            continue
+                        
+                        all_messages.append(memory_message_dict)
+                        
+                        # Extract memory from the single tool call
+                        memory_tool_call = memory_message.tool_calls[0]
+                        func_args = json.loads(memory_tool_call.function.arguments)
+                        
+                        latest_memory = func_args.get("report", "")
+                        logger.info(f"🧠 Memory (unverified): {latest_memory[:200]}{'...' if len(latest_memory) > 200 else ''}")
+                        
+                        if tool_call_log_file:
+                            with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                                f.write(f"| update_memory ({len(tool_contexts_since_last_memory)} calls)\n")
+                                f.write(f"  Memory: {latest_memory}\n")
+                        
+                        all_messages.append({
+                            "role": "tool",
+                            "tool_call_id": memory_tool_call.id,
+                            "content": f"Memory recorded: {latest_memory}"
+                        })
+                        
+                        # === VERIFICATION PHASE ===
+                        # Now verify the generated memory
+                        verification_tool_def = self._create_verify_memory_tool()
+                        verification_tool = {"type": "function", "function": verification_tool_def}
+                        
+                        verification_messages = self._build_messages_with_context(
+                            instruction=instruction,
+                            latest_memory=latest_memory,
+                            last_tool_contexts=tool_contexts_since_last_memory,
+                            mode="verify"
+                        )
+                        
+                        verification_kwargs = {
+                            "model": self.litellm_input_model_name,
+                            "messages": verification_messages,
+                            "api_key": self.api_key,
+                            "tools": [verification_tool],
+                            "tool_choice": {
+                                "type": "function",
+                                "function": {"name": "verify_memory"}
+                            }
+                        }
+                        
+                        if self.reasoning_effort != "default":
+                            verification_kwargs["reasoning_effort"] = self.reasoning_effort
+                        if self.base_url:
+                            verification_kwargs["base_url"] = self.base_url
+                        
+                        logger.info(f"verify_memory call")
+                        
+                        try:
+                            if self._openai_client:
+                                verification_response = await asyncio.wait_for(
+                                    self._openai_client.acompletion(
+                                        messages=verification_messages,
+                                        tools=verification_kwargs.get("tools"),
+                                        tool_choice=verification_kwargs.get("tool_choice"),
+                                    ),
+                                    timeout=self.timeout / 2
+                                )
+                            else:
+                                verification_response = await asyncio.wait_for(
+                                    litellm.acompletion(**verification_kwargs),
+                                    timeout=self.timeout / 2
+                                )
+                            consecutive_failures = 0
+                        except asyncio.TimeoutError:
+                            logger.warning("| ✗ Verification call timed out; using unverified memory")
+                            continue
+                        except Exception as e:
+                            logger.error(f"| ✗ Verification call failed: {e}; using unverified memory")
+                            continue
+                        
+                        _record_usage(verification_response)
+                        
+                        verification_choices = verification_response.choices
+                        if not len(verification_choices):
+                            logger.error("| Verification call returned no choices; using unverified memory")
+                            continue
+                        
+                        verification_message = verification_choices[0].message
+                        verification_message_dict = verification_message.model_dump() if hasattr(verification_message, 'model_dump') else dict(verification_message)
+                        
+                        if not hasattr(verification_message, 'tool_calls') or not verification_message.tool_calls:
+                            logger.error("| Verification call did not return verify_memory tool call; using unverified memory")
+                            continue
+                        
+                        all_messages.append(verification_message_dict)
+                        
+                        # Extract verified memory from the single tool call
+                        verify_tool_call = verification_message.tool_calls[0]
+                        verify_func_args = json.loads(verify_tool_call.function.arguments)
+                        
+                        verified_memory = verify_func_args.get("verified_report", latest_memory)
+                        issues_found = verify_func_args.get("issues_found", "Unknown")
+                        
+                        # Replace latest_memory with verified version
+                        latest_memory = verified_memory
+                        
+                        if issues_found.lower() == "none":
+                            logger.info(f"✅ Memory verified (no issues): {verified_memory[:200]}{'...' if len(verified_memory) > 200 else ''}")
+                        else:
+                            logger.info(f"🔧 Memory verified with corrections: {issues_found[:100]}{'...' if len(issues_found) > 100 else ''}")
+                            logger.info(f"✅ Corrected Memory: {verified_memory[:200]}{'...' if len(verified_memory) > 200 else ''}")
+                        
+                        if tool_call_log_file:
+                            with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                                f.write(f"| verify_memory\n")
+                                f.write(f"  Issues Found: {issues_found}\n")
+                                f.write(f"  Verified Memory: {verified_memory}\n")
+                        
+                        all_messages.append({
+                            "role": "tool",
+                            "tool_call_id": verify_tool_call.id,
+                            "content": f"Memory verified. Issues: {issues_found}"
+                        })
+                        
+                        # Update progress with memory and verification responses
+                        self._update_progress([memory_message_dict, verification_message_dict], total_tokens, turn_count)
+                        
+                        # Reset accumulated contexts after successful memory update
+                        # (tool_call_history is kept for action LLM's full context)
+                        tool_contexts_since_last_memory = []
+                    else:
+                        # Skip memory update this turn
+                        if action_tool_executed:
+                            logger.info(f"⏭️  Memory update skipped ({len(tool_contexts_since_last_memory)}/{self.memory_update_threshold} calls accumulated)")
+                    
+                    continue
+                else:
+                    # Log end reason
+                    if not choices:
+                        logger.info("|\n|\n| Task ended with no messages generated by the model.")
+                    elif choices[0].finish_reason == "stop":
+                        logger.info("|\n|\n| Task ended with the finish reason from messages being 'stop'.")
+                    
+                    # No tool/function call, add message and we're done
+                    all_messages.append(message_dict)
+                    turn_count += 1
+                    # Update progress before exiting
+                    messages_for_progress = [message_dict]
+                    self._update_progress(messages_for_progress, total_tokens, turn_count)
+                    ended_normally = True
+                    break
+                
+        except Exception as loop_error:
+            # On any error, return partial conversation, token usage, and turn count
+            logger.error(f"Manual MCP loop failed: {loop_error}", exc_info=True)
+            sdk_format_messages = self._convert_to_sdk_format(all_messages)
+            return {
+                "success": False,
+                "output": sdk_format_messages,
+                "token_usage": total_tokens,
+                "turn_count": turn_count,
+                "error": str(loop_error),
+                "litellm_run_model_name": self.litellm_run_model_name,
+            }
+        
+        # Detect if we exited due to hitting the turn limit
+        if (not ended_normally) and (turn_count >= max_turns):
+            hit_turn_limit = True
+            logger.warning(f"| Max turns ({max_turns}) exceeded); returning failure with partial output.")
+            if tool_call_log_file:
+                try:
+                    with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                        f.write(f"| Max turns ({max_turns}) exceeded\n")
+                except Exception:
+                    pass
+
+        # Display final token usage
+        if total_tokens["total_tokens"] > 0:
+            log_msg = (
+                f"| Token usage: Total: {total_tokens['total_tokens']:,} | "
+                f"Input: {total_tokens['input_tokens']:,} | "
+                f"Output: {total_tokens['output_tokens']:,}"
+            )
+            if total_tokens.get("reasoning_tokens", 0) > 0:
+                log_msg += f" | Reasoning: {total_tokens['reasoning_tokens']:,}"
+            logger.info(log_msg)
+            logger.info(f"| Turns: {turn_count}")
+        
+        # Convert messages to SDK format for backward compatibility
+        sdk_format_messages = self._convert_to_sdk_format(all_messages)
+        
+        return {
+            "success": not hit_turn_limit,
+            "output": sdk_format_messages,
+            "token_usage": total_tokens,
+            "turn_count": turn_count,
+            "error": (f"Max turns ({max_turns}) exceeded" if hit_turn_limit else None),
+            "litellm_run_model_name": self.litellm_run_model_name
+        }
+    
     async def _execute_litellm_tool_loop(
         self,
         instruction: str,
@@ -784,6 +1647,13 @@ class MCPMarkAgent(BaseMCPAgent):
 
     async def _create_mcp_server(self) -> Any:
         """Create and return an MCP server instance."""
+        # Check if service is configured for HTTP/REST mode
+        use_http_mode = self.service_config.get("use_http_mode", False)
+        
+        # For dual-mode services, check the mode configuration
+        if self.mcp_service in self.DUAL_MODE_SERVICES and use_http_mode:
+            return self._create_http_server()
+        
         if self.mcp_service in self.STDIO_SERVICES:
             return self._create_stdio_server()
         elif self.mcp_service in self.HTTP_SERVICES:
@@ -874,6 +1744,13 @@ class MCPMarkAgent(BaseMCPAgent):
                     "User-Agent": "MCPMark/1.0"
                 }
             )
+        
+        elif self.mcp_service == "filesystem":
+            rest_url = self.service_config.get("rest_url", "http://127.0.0.1:8001")
+            rest_headers = self.service_config.get("rest_headers", {})
+            logger.info(f"Connecting to filesystem MCP REST server at: {rest_url}")
+            return MCPRestClient(url=rest_url, headers=rest_headers)
+        
         else:
             raise ValueError(f"Unsupported HTTP service: {self.mcp_service}")
     

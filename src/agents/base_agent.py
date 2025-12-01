@@ -10,7 +10,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Callable
 
 from src.logger import get_logger
-from .mcp import MCPStdioServer, MCPHttpServer
+from .mcp import MCPStdioServer, MCPHttpServer, MCPRestClient
 from .utils import TokenUsageTracker
 
 logger = get_logger(__name__)
@@ -21,6 +21,8 @@ class BaseMCPAgent(ABC):
 
     STDIO_SERVICES = ["notion", "filesystem", "playwright", "playwright_webarena", "postgres"]
     HTTP_SERVICES = ["github"]
+    # Services that support both STDIO and HTTP modes
+    DUAL_MODE_SERVICES = ["filesystem"]
     DEFAULT_TIMEOUT = 600
 
     CLAUDE_THINKING_BUDGETS = {
@@ -140,6 +142,13 @@ class BaseMCPAgent(ABC):
     # ------------------------------------------------------------------
 
     async def _create_mcp_server(self) -> Any:
+        # Check if service is configured for HTTP/REST mode
+        use_http_mode = self.service_config.get("use_http_mode", False)
+        
+        # For dual-mode services, check the mode configuration
+        if self.mcp_service in self.DUAL_MODE_SERVICES and use_http_mode:
+            return self._create_http_server()
+        
         if self.mcp_service in self.STDIO_SERVICES:
             return self._create_stdio_server()
         if self.mcp_service in self.HTTP_SERVICES:
@@ -221,6 +230,13 @@ class BaseMCPAgent(ABC):
                     "User-Agent": "MCPMark/1.0",
                 },
             )
+        
+        if self.mcp_service == "filesystem":
+            rest_url = self.service_config.get("rest_url", "http://127.0.0.1:8001")
+            rest_headers = self.service_config.get("rest_headers", {})
+            logger.info(f"Connecting to filesystem MCP REST server at: {rest_url}")
+            return MCPRestClient(url=rest_url, headers=rest_headers)
+        
         raise ValueError(f"Unsupported HTTP service: {self.mcp_service}")
 
     # ------------------------------------------------------------------

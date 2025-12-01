@@ -170,6 +170,9 @@ class GenericConfigSchema(ConfigSchema):
                 transform = lambda x: Path(x) if x else None
             elif transform_str == "list":
                 transform = lambda x: [t.strip() for t in x.split(",")] if x else []
+            elif transform_str == "json":
+                import json
+                transform = lambda x: json.loads(x) if x and isinstance(x, str) else (x if x else {})
 
             # Handle validator strings
             validator = None

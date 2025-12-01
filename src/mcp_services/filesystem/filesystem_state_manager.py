@@ -240,11 +240,47 @@ class FilesystemStateManager(BaseStateManager):
         Returns:
             Dictionary containing configuration needed by the agent/MCP server
         """
+        from src.config.config_schema import ConfigRegistry
+        import requests
+
+        # Get the config from registry
+        config = ConfigRegistry.get_config("filesystem").get_all()
         service_config = {}
 
         # Add test directory if available
         if self.current_task_dir:
             service_config["test_directory"] = str(self.current_task_dir)
+            
+            # If using HTTP mode, configure the REST server with the backup directory
+            use_http_mode = config.get("use_http_mode", False)
+            if use_http_mode:
+                rest_url = config.get("rest_url", "http://127.0.0.1:8001")
+                # Convert host path to container path
+                container_path = str(self.current_task_dir).replace(
+                    str(self._get_project_root()), "/app"
+                )
+                # Configure the REST server with the backup directory
+                try:
+                    logger.info(f"Configuring REST server with directory: {container_path}")
+                    response = requests.post(
+                        f"{rest_url}/configure",
+                        json={"allowedDirectory": container_path},
+                        timeout=15  # Allow time for server to restart and initialize
+                    )
+                    if response.status_code == 200:
+                        logger.info(f"REST server configured and ready with directory: {container_path}")
+                    else:
+                        logger.warning(f"Failed to configure REST server: {response.text}")
+                except Exception as e:
+                    logger.warning(f"Could not configure REST server: {e}")
+
+        # Add HTTP mode configuration if available
+        if "use_http_mode" in config:
+            service_config["use_http_mode"] = config["use_http_mode"]
+        if "rest_url" in config:
+            service_config["rest_url"] = config["rest_url"]
+        if "rest_headers" in config:
+            service_config["rest_headers"] = config["rest_headers"]
 
         return service_config
 

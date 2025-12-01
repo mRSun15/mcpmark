@@ -24,7 +24,7 @@ The `total_budget.txt` file should contain:
 
 ### Important Notes
 
-- Only include personal life expenses (not in project/work)
+- Only include personal life expenses (which means expense not in project/work directory only)
 - Use the cheapest available price when multiple options exist for one thing
 - The total should match the sum of all individual expenses
 - Hint: If a file contains 1 item for personal consumption, it means that all the entry in entire file is for personal consumption

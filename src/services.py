@@ -129,6 +129,26 @@ SERVICES = {
                 "description": "Clean up test directories after tasks",
                 "transform": "bool",
             },
+            "use_http_mode": {
+                "env_var": "FILESYSTEM_USE_HTTP_MODE",
+                "default": False,
+                "required": False,
+                "description": "Use HTTP/REST mode instead of STDIO",
+                "transform": "bool",
+            },
+            "rest_url": {
+                "env_var": "FILESYSTEM_REST_URL",
+                "default": "http://127.0.0.1:8001",
+                "required": False,
+                "description": "REST server URL for filesystem MCP service",
+            },
+            "rest_headers": {
+                "env_var": "FILESYSTEM_REST_HEADERS",
+                "default": {},
+                "required": False,
+                "description": "Additional headers for REST requests (JSON format)",
+                "transform": "json",
+            },
         },
         "components": {
             "task_manager": "src.mcp_services.filesystem.filesystem_task_manager.FilesystemTaskManager",
@@ -139,6 +159,11 @@ SERVICES = {
             "state_manager": {
                 "test_root": "test_root",
                 "cleanup_on_exit": "cleanup_on_exit",
+            },
+            "agent": {
+                "use_http_mode": "use_http_mode",
+                "rest_url": "rest_url",
+                "rest_headers": "rest_headers",
             }
         },
         "mcp_server": None,

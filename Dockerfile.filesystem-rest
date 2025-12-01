@@ -1,0 +1,33 @@
+FROM node:20-alpine
+
+# Install required packages
+RUN apk add --no-cache curl
+
+# Set working directory
+WORKDIR /app
+
+# Copy the REST server script
+COPY filesystem-rest-server.js /app/
+
+# Make script executable
+RUN chmod +x /app/filesystem-rest-server.js
+
+# Install MCP filesystem server globally
+RUN npm install -g @modelcontextprotocol/server-filesystem
+
+# Expose REST API port
+EXPOSE 8001
+
+# Set default environment variables
+ENV MCP_SERVER_PORT=8001
+ENV MCP_ALLOWED_DIRECTORY=/app
+
+# App directory already created by WORKDIR above
+
+# Health check
+HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3 \
+  CMD curl -f http://localhost:8001/health || exit 1
+
+# Start the REST server
+CMD ["node", "/app/filesystem-rest-server.js"]
+
