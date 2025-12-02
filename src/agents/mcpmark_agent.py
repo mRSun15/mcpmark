@@ -36,13 +36,17 @@ class MCPMarkAgent(BaseMCPAgent):
     """
 
     MAX_TURNS = 100
+    # Critical tools that should trigger memory update when called
+    CRITICAL_TOOLS_FOR_MEMORY = {
+        "read_multiple_files",
+        "directory_tree",
+    }
     SYSTEM_PROMPT = (
         "You are a helpful agent that uses tools iteratively to complete the user's task, "
         "and when finished, provides the final answer or simply states \"Task completed\" without further tool calls. CRITICAL RULES: "
         "1. you should strictly follow the user's instructions, no extra inference or reasoning unless it is explicitly requested; "
         "2. memory is a compression summary of what you have done, key facts and taks plan, you may reference it for next tool calls. "
-        "If memory contains VERIFIED CONSTRAINTS section, you MUST check it before each tool call and avoid violating those specific constraints. "
-        "3. there may be typos in the task description, use your judgment to infer the correct names/terms when possible; "
+        "3. If memory contains VERIFIED CONSTRAINTS section, you MUST check it before each tool call and avoid violating those specific constraints. "
         "4. for time related tasks, if not specified, please use the time zone of GMT+0800 (China Standard Time). "
         "5. use code to solve problem if possible. "
         "6. Avoid unnecessary redundantly calling the same tool with identical arguments."
@@ -57,15 +61,17 @@ class MCPMarkAgent(BaseMCPAgent):
         "\n"
         "**TASK PLAN**\n"
         "- Bullet list of the current plan or next steps; reorder or edit as understanding changes.\n"
-        "- Ensure the plan is directly aligned with the user's instructions—do not add steps or goals not requested.\n"
+        "- Ensure the plan is strictly aligned with the user's instructions: do not add goals, make extra inference or reasoning unless it is explicitly requested.\n"
+        "- There might be some typos in the task description, use your judgment to correct."
         "\n"
         "**PROGRESS & GAPS**\n"
         "- Bullet list of work finished, outstanding items, and explicit blockers.\n"
         "\n"
         "**PERSISTENT FACTS**\n"
         "- Bullet list for persistent metrics/identifiers (counts, aggregates, paths, key entities) related to the task.\n"
-        "- Wherever possible, store concrete values (exact IDs, directory paths, thresholds), don't use general or vague values. (if it's an tree/list, store the details of each item if possible)\n"
+        "- Wherever possible, store concrete detailed values (exact IDs, directory paths, thresholds), don't use general or vague values. e.g, if it's an subtree/list/subdirectory, store the details of each item if possible)\n"
         "- Only change items here when a tool result or clear logic definitively updates them; otherwise carry them forward.\n"
+        "- Don't change the extracted facts based on your own custom, use the raw value always, e.g no name conversion or abbreviation."
         "- The FACTS should be CONCRETE, CORRECT and NOT CONTRADICTORY to each others. "
         "\n"
         "**CONSTRAINTS**\n"
@@ -76,26 +82,36 @@ class MCPMarkAgent(BaseMCPAgent):
         "- If the prior memory contains a VERIFIED CONSTRAINTS section, carry it forward EXACTLY as-is. Never modify or remove items from this section.\n"
         "- This section contains specific constraints/issues (with concrete names/paths/IDs) discovered during verification that must persist and should not be violated.\n"
         "\n"
-        "Rules: keep the memory concise yet precise, cite only tool-backed information or direct logical consequences, assume GMT+08:00 (China Standard Time) for unspecified timestamps, and if nothing new was learned leave the memory unchanged."
+        "Rules: keep the memory concise yet precise, cite only tool-backed information or direct logical consequences. If nothing new was learned leave the memory unchanged."
     )
     VERIFICATION_SYSTEM_PROMPT = (
-        "You are a verification agent responsible for validating the newly generated memory report based on the latest tool calls. Check:\n"
+        "You are a verification agent responsible for validating and correcting memory reports. "
+        "Your task is to verify the generated memory for correctness and consistency. Specifically, check:\n"
         "\n"
-        "1. **COMPLETENESS**: Verify all key requirements and tasks instructions are captured, flag missing aspects.\n"
+        "1. **PERSISTENT FACTS CORRECTNESS**: Verify that all concrete values (counts, paths, IDs, metrics) are accurate based on the task description and recent tool results. "
+        "Flag any values that seem inconsistent or unsupported by evidence.\n"
         "\n"
-        "2. **SPECIFICITY**: Ensure concrete details (names, paths, values) match task requirements, not generic placeholders.\n"
+        "2. **LOGICAL CONSISTENCY**: Ensure the memory sections are internally consistent. "
+        "The TASK PLAN should align with the OVERVIEW; PROGRESS & GAPS should not contradict STATUS FACTS; "
+        "CONSTRAINTS should be compatible with the stated plan.\n"
         "\n"
-        "3. **CORRECNESS**: Verify facts are accurate, consistent and supported by tool results. No fabricated or contradictory information."
+        "3. **COMPLETENESS**: Check for missing critical information. "
+        "Are there important tool results not reflected in STATUS FACTS? "
+        "Are there obvious next steps missing from TASK PLAN? "
+        "Are blockers or gaps properly documented?\n"
         "\n"
-        "4. **LOGICAL CONSISTENCY**: Sections align—TASK PLAN matches OVERVIEW; PROGRESS & GAPS doesn't contradict PERSISTENT FACTS; CONSTRAINTS are compatible with the plan.\n"
+        "4. **REASONING CORRECTNESS**: Verify that any logical inferences are valid. "
+        "Ensure no facts are fabricated or assumed without tool support. "
+        "Check that cause-effect relationships make sense.\n"
         "\n"
-        "5. **REASONING CORRECTNESS**: Logical inferences are valid. No fabricated assumptions. Cause-effect relationships make sense.\n"
-        "\n"
-        "6. **FORMAT & CLARITY**: Confirm the propoer structure (OVERVIEW, TASK PLAN, PROGRESS & GAPS, PERSISTENT FACTS, CONSTRAINTS, VERIFIED CONSTRAINTS if present)"
+        "5. **FORMAT & CLARITY**: Confirm the memory follows the required structure (OVERVIEW, TASK PLAN, PROGRESS & GAPS, PERSISTENT FACTS, CONSTRAINTS, VERIFIED CONSTRAINTS if present). "
+        "Ensure the language is clear, concise, and actionable.\n"
         "\n"
         "6. **VERIFIED CONSTRAINTS MANAGEMENT**: When you discover errors from above analysis, add them to the VERIFIED CONSTRAINTS section:\n"
         "   - If it doesn't exist (first verification issue discovered), create the section in the memory\n"
         "   - CRITICAL: Constraints must be SPECIFIC and CONCRETE with actual entity names, paths, IDs, values from the error\n"
+        "   - DO NOT use abstract or general descriptions, always reference the actual entities invovled\n"
+        "   - Include both: (1) the specific instance that failed with actual names, (2) the underlying rule explaining why\n"
         "\n"
         "Call verify_memory with your analysis. If issues are found, provide a corrected version. "
         "If no issue observed, return it unchanged but acknowledge its validity."
@@ -843,6 +859,14 @@ class MCPMarkAgent(BaseMCPAgent):
 
         return "\n".join(recurse(entries, "", True))
 
+    def _contains_critical_tools(self, tool_contexts: List[Dict[str, Any]]) -> bool:
+        """Check if any critical tools were called in the given tool contexts."""
+        for ctx in tool_contexts:
+            tool_name = ctx.get("name", "")
+            if tool_name in self.CRITICAL_TOOLS_FOR_MEMORY:
+                return True
+        return False
+
 
     def _get_report_model_config(self) -> Dict[str, Optional[str]]:
         """Return the model/api/base_url tuple for report summarization."""
@@ -1123,16 +1147,26 @@ class MCPMarkAgent(BaseMCPAgent):
                     turn_count += 1
                     self._update_progress(messages_for_progress, total_tokens, turn_count)
                     
+                    # Check if critical tools were called
+                    has_critical_tools = self._contains_critical_tools(tool_contexts_since_last_memory)
+                    
                     # Decide if we should update memory based on accumulated tool calls
                     should_update_memory = (
                         action_tool_executed and (
                             turn_count <= 3  # First 3 turns always update
                             or len(tool_contexts_since_last_memory) >= self.memory_update_threshold
                             or turn_count >= max_turns - 5  # Near end always update
+                            or has_critical_tools  # Critical tools always trigger memory update
                         )
                     )
                     
                     if should_update_memory:
+                        # Log reason for memory update
+                        if has_critical_tools:
+                            critical_tool_names = [ctx.get("name") for ctx in tool_contexts_since_last_memory 
+                                                  if ctx.get("name") in self.CRITICAL_TOOLS_FOR_MEMORY]
+                            logger.info(f"🔑 Critical tool(s) detected: {critical_tool_names} - triggering memory update")
+                        
                         # Build messages with accumulated tool contexts
                         memory_messages = self._build_messages_with_context(
                             instruction=instruction,
@@ -1330,7 +1364,7 @@ class MCPMarkAgent(BaseMCPAgent):
                     else:
                         # Skip memory update this turn
                         if action_tool_executed:
-                            logger.info(f"⏭️  Memory update skipped ({len(tool_contexts_since_last_memory)}/{self.memory_update_threshold} calls accumulated)")
+                            logger.info(f"⏭️  Memory update skipped ({len(tool_contexts_since_last_memory)}/{self.memory_update_threshold} calls accumulated, no critical tools)")
                     
                     continue
                 else:
