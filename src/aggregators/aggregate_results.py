@@ -30,10 +30,10 @@ def discover_tasks() -> Dict[str, List[str]]:
     # Note: playwright and playwright_webarena both map to "playwright" MCP
     service_mappings = {
         "filesystem": ["filesystem"],
-        "github": ["github"],
-        "notion": ["notion"],
-        "playwright": ["playwright", "playwright_webarena"],  # Both count as playwright
-        "postgres": ["postgres"]
+        # "github": ["github"],
+        # "notion": ["notion"],
+        # "playwright": ["playwright", "playwright_webarena"],  # Both count as playwright
+        # "postgres": ["postgres"]
     }
     
     for mcp_service, task_dirs in service_mappings.items():
