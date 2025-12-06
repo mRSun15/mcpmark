@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Callable
 import httpx
 import litellm
 import nest_asyncio
+import tiktoken
 
 from src.logger import get_logger
 from .base_agent import BaseMCPAgent
@@ -41,6 +42,29 @@ class MCPMarkAgent(BaseMCPAgent):
         "read_multiple_files",
         "directory_tree",
     }
+    # Model context window limits (in tokens)
+    MODEL_CONTEXT_LIMITS = {
+        "gpt-5": 272000,
+        "gpt-5-mini": 272000,
+        "gpt-5-nano": 272000,
+        "gpt-4.1": 200000,
+        "gpt-4.1-mini": 200000,
+        "gpt-4.1-nano": 200000,
+        "gpt-4o": 128000,
+        "o3": 200000,
+        "o4-mini": 200000,
+        "claude-3.7-sonnet": 200000,
+        "claude-sonnet-4": 200000,
+        "claude-opus-4": 200000,
+        "claude-opus-4.1": 200000,
+        "gemini-2.5-pro": 1000000,
+        "gemini-2.5-flash": 1000000,
+        "deepseek-chat": 64000,
+        "deepseek-reasoner": 64000,
+        "default": 128000,  # Fallback for unknown models
+    }
+    # Compression threshold: trigger compression if tool results exceed this % of remaining budget
+    COMPRESSION_THRESHOLD = 0.8
     SYSTEM_PROMPT = (
         "You are a helpful agent that uses tools iteratively to complete the user's task, "
         "and when finished, provides the final answer or simply states \"Task completed\" without further tool calls. CRITICAL RULES: "
@@ -49,7 +73,8 @@ class MCPMarkAgent(BaseMCPAgent):
         "3. If memory contains VERIFIED CONSTRAINTS section, you MUST check it before each tool call and avoid violating those specific constraints. "
         "4. for time related tasks, if not specified, please use the time zone of GMT+0800 (China Standard Time). "
         "5. use code to solve problem if possible. "
-        "6. Avoid unnecessary redundantly calling the same tool with identical arguments."
+        "6. Avoid unnecessary redundantly calling to improve efficiency. "
+        "7. Critical: Avoid using read_multiple_files with too many files at once as it may exceed context limits. Read files in smaller one by one when dealing with large numbers of files."
     )
     MEMORY_SYSTEM_PROMPT = (
         "You own the shared task memory—call update_memory to keep it accurate. "
@@ -63,6 +88,7 @@ class MCPMarkAgent(BaseMCPAgent):
         "- Bullet list of the current plan or next steps; reorder or edit as understanding changes.\n"
         "- Ensure plan aligns strictly with user instructions: do not add goals or make extra inferences/reasoning unless it is explicitly requested.\n"
         "- The task instructions might have a few typos or ambiguities, you may discover and correct them based on tool call results.\n"
+        "- When planning file operations: read files one by one when dealing with large numbers of files to avoid context limits; extract all needed information in a single read; use head/tail parameters when only needing beginning/end of files.\n"
         "\n"
         "**PROGRESS & GAPS**\n"
         "- Finished: actions completed with tool confirmation.\n"
@@ -110,8 +136,19 @@ class MCPMarkAgent(BaseMCPAgent):
         "   - Include: (1) specific instance that failed with actual names, (2) underlying rule explaining why\n"
         "   - Create this section if it doesn't exist\n"
         "\n"
+        "5. **DO NOT REMOVE EXECUTION GUIDANCE**: Do not remove operational instructions from TASK PLAN "
+        "that guide efficient execution (e.g., how to process files, batch sizes, parameters to use). "
+        "Keep them even if rewriting other sections, unless they directly contradict verified facts.\n"
+        "\n"
         "Call verify_memory with your analysis. If issues found, provide corrected version. "
         "If no issues, return unchanged and acknowledge validity."
+    )
+    COMPRESSION_SYSTEM_PROMPT = (
+        "You are a compression agent. Extract ONLY the information from the tool result "
+        "that is directly relevant to completing the user's instruction.\n\n"
+        "Provide a concise extraction of instruction-relevant information. "
+        "Include specific values, paths, names, and facts needed to complete the task. "
+        "Omit unnecessary details, verbose descriptions, and irrelevant data."
     )
     ACTION_SYSTEM_PROMPT = SYSTEM_PROMPT
     DEFAULT_TIMEOUT = BaseMCPAgent.DEFAULT_TIMEOUT
@@ -876,6 +913,352 @@ class MCPMarkAgent(BaseMCPAgent):
             "base_url": base_url
         }
 
+    def _get_model_context_limit(self) -> int:
+        """Get the context window limit for the current model."""
+        # Extract short model name from litellm format (e.g., "openai/gpt-5" -> "gpt-5")
+        model_name = self.litellm_input_model_name.split("/")[-1] if "/" in self.litellm_input_model_name else self.litellm_input_model_name
+        
+        # Check if model name contains any known model key
+        for model_key, limit in self.MODEL_CONTEXT_LIMITS.items():
+            if model_key in model_name:
+                return limit
+        
+        # Return default if not found
+        return self.MODEL_CONTEXT_LIMITS["default"]
+
+    def _estimate_tokens(self, text: str) -> int:
+        """
+        Estimate token count for a given text using tiktoken.
+        Uses cl100k_base encoding which works for GPT-4, GPT-5, and approximates well for other models.
+        """
+        try:
+            # Use cl100k_base encoding (GPT-4, GPT-5, etc.)
+            encoding = tiktoken.get_encoding("cl100k_base")
+            return len(encoding.encode(text))
+        except Exception as e:
+            logger.warning(f"Failed to estimate tokens with tiktoken: {e}. Using character-based fallback.")
+            # Fallback: rough approximation (1 token ≈ 4 characters)
+            return len(text) // 4
+
+    def _parse_read_multiple_files_result(self, formatted_result: str) -> List[Dict[str, str]]:
+        """
+        Parse read_multiple_files result into individual file entries.
+        
+        Format:
+        /path/to/file1.txt:
+        <content>
+        
+        /path/to/file2.txt:
+        <content>
+        
+        Returns list of {path: str, content: str}
+        """
+        files = []
+        lines = formatted_result.split('\n')
+        current_path = None
+        current_content_lines = []
+        
+        for line in lines:
+            # Check if this line is a file path (ends with colon and looks like a path)
+            if line.endswith(':') and (line.startswith('/') or ':\\' in line or line.startswith('C:')):
+                # Save previous file if exists
+                if current_path is not None:
+                    files.append({
+                        'path': current_path,
+                        'content': '\n'.join(current_content_lines)
+                    })
+                # Start new file
+                current_path = line[:-1]  # Remove trailing colon
+                current_content_lines = []
+            else:
+                # Accumulate content lines
+                current_content_lines.append(line)
+        
+        # Save last file
+        if current_path is not None:
+            files.append({
+                'path': current_path,
+                'content': '\n'.join(current_content_lines)
+            })
+        
+        return files
+
+    async def _compress_single_file_content(
+        self,
+        file_path: str,
+        file_content: str,
+        instruction: str,
+        tool_call_log_file: Optional[str] = None
+    ) -> str:
+        """
+        Compress a single file's content from read_multiple_files.
+        
+        Returns compressed content string.
+        """
+        original_tokens = self._estimate_tokens(file_content)
+        
+        # Build simple compression prompt (no tool calls to avoid confusing model or triggering filters)
+        user_prompt = f"{instruction}\n\nFile: {file_path}\n\nContent to compress:\n{file_content}"
+        
+        messages = [
+            {"role": "system", "content": self.COMPRESSION_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt}
+        ]
+        
+        try:
+            completion_kwargs = {
+                "model": self.litellm_input_model_name,
+                "messages": messages,
+                "api_key": self.api_key,
+            }
+            
+            if self.base_url:
+                completion_kwargs["base_url"] = self.base_url
+            
+            response = await asyncio.wait_for(
+                litellm.acompletion(**completion_kwargs),
+                timeout=60
+            )
+            
+            if response.choices and len(response.choices) > 0:
+                compressed_content = response.choices[0].message.content or file_content
+            else:
+                compressed_content = file_content
+            
+            compressed_tokens = self._estimate_tokens(compressed_content)
+            compression_ratio = compressed_tokens / original_tokens if original_tokens > 0 else 1.0
+            
+            logger.info(f"| 🗜️  Compressed file {file_path}: {original_tokens} → {compressed_tokens} tokens ({compression_ratio:.1%})")
+            if tool_call_log_file:
+                with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                    f.write(f"\n[COMPRESSED FILE] {file_path}: {original_tokens} → {compressed_tokens} tokens\n")
+            
+            return compressed_content
+            
+        except Exception as e:
+            logger.warning(f"| ⚠️  Compression failed for {file_path}: {e}. Using original.")
+            return file_content
+
+    async def _compress_single_tool_result(
+        self,
+        tool_context: Dict[str, Any],
+        instruction: str,
+        latest_memory: str,
+        tool_call_log_file: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Compress a single tool result using LLM to extract task-relevant information.
+        Special handling for read_multiple_files: compress each file individually.
+        
+        Args:
+            tool_context: Tool context containing name, result, formatted_result, etc.
+            instruction: Original task instruction
+            latest_memory: Current memory state
+            tool_call_log_file: Optional log file path
+            
+        Returns:
+            Updated tool_context with compressed formatted_result
+        """
+        tool_name = tool_context.get("name", "unknown")
+        original_result = tool_context.get("formatted_result", "")
+        original_tokens = self._estimate_tokens(original_result)
+        tool_call_id = tool_context.get("id", "call_0")
+        tool_arguments = tool_context.get("arguments", "{}")
+        
+        # Special handling for read_multiple_files
+        if tool_name == "read_multiple_files":
+            try:
+                # Parse individual files
+                files = self._parse_read_multiple_files_result(original_result)
+                logger.info(f"| 📄 Detected read_multiple_files with {len(files)} files. Compressing individually...")
+                
+                # Compress each file
+                compressed_files = []
+                for file_info in files:
+                    compressed_content = await self._compress_single_file_content(
+                        file_info['path'],
+                        file_info['content'],
+                        instruction,
+                        tool_call_log_file
+                    )
+                    compressed_files.append(f"{file_info['path']}:\n{compressed_content}")
+                
+                # Reassemble result
+                final_compressed = "\n\n".join(compressed_files)
+                compressed_tokens = self._estimate_tokens(final_compressed)
+                compression_ratio = compressed_tokens / original_tokens if original_tokens > 0 else 1.0
+                
+                formatted_compressed = f"Compressed content (task-oriented extraction):\n{final_compressed}"
+                
+                logger.info(f"| 🗜️  Total compression for read_multiple_files: {original_tokens} → {compressed_tokens} tokens ({compression_ratio:.1%})")
+                if tool_call_log_file:
+                    with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                        f.write(f"\n[COMPRESSED] read_multiple_files (total): {original_tokens} → {compressed_tokens} tokens\n")
+                        f.write(f"{final_compressed}\n\n")
+                
+                # Update tool context
+                updated_context = dict(tool_context)
+                updated_context["formatted_result"] = formatted_compressed
+                updated_context["original_tokens"] = original_tokens
+                updated_context["compressed_tokens"] = compressed_tokens
+                
+                return updated_context
+                
+            except Exception as e:
+                logger.error(f"| ✗ Failed to parse/compress read_multiple_files: {e}. Falling back to normal compression.")
+                # Fall through to normal compression
+        
+        # Normal compression for other tools (or fallback for read_multiple_files)
+        
+        # Build simple compression prompt (no tool calls to avoid confusing model or triggering filters)
+        user_prompt = f"{instruction}\n\nTool: {tool_name}\nArguments: {tool_arguments}\n\nContent to compress:\n{original_result}"
+        
+        messages = [
+            {"role": "system", "content": self.COMPRESSION_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt}
+        ]
+        
+        try:
+            # Call LLM for compression using same model as main agent
+            completion_kwargs = {
+                "model": self.litellm_input_model_name,
+                "messages": messages,
+                "api_key": self.api_key,
+            }
+            
+            if self.base_url:
+                completion_kwargs["base_url"] = self.base_url
+            
+            response = await asyncio.wait_for(
+                litellm.acompletion(**completion_kwargs),
+                timeout=60
+            )
+            
+            # Extract compressed content
+            if response.choices and len(response.choices) > 0:
+                compressed_content = response.choices[0].message.content or original_result
+            else:
+                compressed_content = original_result
+            
+            compressed_tokens = self._estimate_tokens(compressed_content)
+            compression_ratio = compressed_tokens / original_tokens if original_tokens > 0 else 1.0
+            
+            # Format with compression marker
+            formatted_compressed = f"Compressed content (task-oriented extraction):\n{compressed_content}"
+            
+            # Log compression details
+            logger.info(f"| 🗜️  Compressed {tool_name} result: {original_tokens} → {compressed_tokens} tokens ({compression_ratio:.1%})")
+            if tool_call_log_file:
+                with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                    f.write(f"\n[COMPRESSED] {tool_name}: {original_tokens} → {compressed_tokens} tokens\n")
+                    f.write(f"{compressed_content}\n\n")
+            
+            # Update tool context with compressed result
+            updated_context = dict(tool_context)
+            updated_context["formatted_result"] = formatted_compressed
+            updated_context["original_tokens"] = original_tokens
+            updated_context["compressed_tokens"] = compressed_tokens
+            
+            return updated_context
+            
+        except Exception as e:
+            logger.error(f"| ✗ Compression failed for {tool_name}: {e}. Using original result.")
+            return tool_context
+
+    async def _compress_tool_results_if_needed(
+        self,
+        tool_contexts: List[Dict[str, Any]],
+        instruction: str,
+        latest_memory: str,
+        all_messages: List[Dict[str, Any]],
+        tool_call_log_file: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Check if tool results exceed token budget and compress if necessary.
+        For read_multiple_files with multiple files, compress each file individually.
+        
+        Args:
+            tool_contexts: List of tool contexts from this turn
+            instruction: Original task instruction
+            latest_memory: Current memory state
+            all_messages: All conversation messages so far
+            tool_call_log_file: Optional log file path
+            
+        Returns:
+            Potentially compressed tool contexts
+        """
+        if not tool_contexts:
+            return tool_contexts
+        
+        # Calculate current conversation tokens
+        conversation_text = json.dumps(all_messages) + instruction + (latest_memory or "")
+        current_conversation_tokens = self._estimate_tokens(conversation_text)
+        
+        # Calculate tool results tokens
+        tool_results_text = "\n".join(ctx.get("formatted_result", "") for ctx in tool_contexts)
+        tool_results_tokens = self._estimate_tokens(tool_results_text)
+        
+        # Get context limit and calculate remaining budget
+        context_limit = self._get_model_context_limit()
+        remaining_budget = context_limit - current_conversation_tokens
+        total_after_adding = current_conversation_tokens + tool_results_tokens
+        
+        logger.info(f"| 📊 Token usage: conversation={current_conversation_tokens}, tool_results={tool_results_tokens}, remaining={remaining_budget}, limit={context_limit}")
+        
+        # Compression logic: check total tokens for this turn
+        MIN_TOKENS_TO_COMPRESS = 5000  # Skip compression if turn total < 5000 tokens
+        LARGE_RESULT_THRESHOLD = 25000  # Always compress if turn total > 25000 tokens
+        
+        # Skip compression if total is too small
+        if tool_results_tokens < MIN_TOKENS_TO_COMPRESS:
+            logger.info(f"| ✓ Tool results ({tool_results_tokens} tokens) below minimum ({MIN_TOKENS_TO_COMPRESS}). Skipping compression.")
+            return tool_contexts
+        
+        # Check if compression is needed
+        should_compress = False
+        
+        if tool_results_tokens > LARGE_RESULT_THRESHOLD:
+            should_compress = True
+        elif remaining_budget <= 0 or total_after_adding > context_limit:
+            should_compress = True
+        elif remaining_budget > 0 and tool_results_tokens > (self.COMPRESSION_THRESHOLD * remaining_budget):
+            should_compress = True
+        
+        if not should_compress:
+            logger.info(f"| ✓ No compression needed.")
+            return tool_contexts
+        
+        logger.warning(f"| ⚠️  Compression triggered. Current: {tool_results_tokens}, Remaining: {remaining_budget}, Limit: {context_limit}")
+        
+        if tool_call_log_file:
+            with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                f.write(f"\n[COMPRESSION TRIGGERED] Current: {tool_results_tokens}, Remaining: {remaining_budget}, Limit: {context_limit}\n")
+        
+        # Compress all tool results in parallel
+        logger.info(f"| 🔄 Compressing {len(tool_contexts)} result(s) in parallel...")
+        
+        compression_tasks = [
+            self._compress_single_tool_result(ctx, instruction, latest_memory, tool_call_log_file)
+            for ctx in tool_contexts
+        ]
+        
+        try:
+            compressed_contexts = await asyncio.wait_for(
+                asyncio.gather(*compression_tasks, return_exceptions=True),
+                timeout=300  # 5 minutes max for all compressions
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"| ✗ Compression timeout after 300s. Using original results.")
+            return tool_contexts
+        
+        # Handle any individual compression failures
+        for i, result in enumerate(compressed_contexts):
+            if isinstance(result, Exception):
+                logger.error(f"| ✗ Compression failed for result {i}: {type(result).__name__}. Using original.")
+                compressed_contexts[i] = tool_contexts[i]
+        
+        return compressed_contexts
+
     async def _execute_two_phase_tool_loop(
         self,
         instruction: str,
@@ -1063,6 +1446,8 @@ class MCPMarkAgent(BaseMCPAgent):
                     all_messages.append(message_dict)
                     # Process tool calls 
                     action_tool_executed = False
+                    tool_contexts_this_turn = []  # Collect tool contexts from this turn only
+                    
                     for tool_call in message.tool_calls:
                         func_name = tool_call.function.name
                         func_args = json.loads(tool_call.function.arguments)
@@ -1074,14 +1459,17 @@ class MCPMarkAgent(BaseMCPAgent):
                                 timeout=60
                             )
                             formatted_result = self._format_tool_result_for_model(result, func_name)
-                            # Store for memory update context (accumulate across turns)
-                            tool_contexts_since_last_memory.append({
+                            # Create tool context
+                            tool_context = {
                                 "name": func_name,
                                 "result": result,
                                 "formatted_result": formatted_result,
                                 "id": tool_call.id,
                                 "arguments": json.dumps(func_args, separators=(",", ": "))
-                            })
+                            }
+                            
+                            # Store in this turn's list only (will append to accumulated lists after compression)
+                            tool_contexts_this_turn.append(tool_context)
                             
                             # Add to messages for output
                             all_messages.append({
@@ -1093,13 +1481,16 @@ class MCPMarkAgent(BaseMCPAgent):
                             error_msg = f"Tool call '{func_name}' timed out after 60 seconds"
                             logger.error(error_msg)
                             formatted_result = error_msg
-                            tool_contexts_since_last_memory.append({
+                            tool_context = {
                                 "name": func_name,
                                 "result": f"Error: {error_msg}",
                                 "formatted_result": formatted_result,
                                 "id": tool_call.id,
                                 "arguments": json.dumps(func_args, separators=(",", ": "))
-                            })
+                            }
+                            
+                            # Store in this turn's list only
+                            tool_contexts_this_turn.append(tool_context)
                             
                             # Add error to messages
                             all_messages.append({
@@ -1110,13 +1501,16 @@ class MCPMarkAgent(BaseMCPAgent):
                         except Exception as e:
                             logger.error(f"Tool call failed: {e}")
                             formatted_result = f"Error: {str(e)}"
-                            tool_contexts_since_last_memory.append({
+                            tool_context = {
                                 "name": func_name,
                                 "result": f"Error: {str(e)}",
                                 "formatted_result": formatted_result,
                                 "id": tool_call.id,
                                 "arguments": json.dumps(func_args, separators=(",", ": "))
-                            })
+                            }
+                            
+                            # Store in this turn's list only
+                            tool_contexts_this_turn.append(tool_context)
                             
                             # Add error to messages
                             all_messages.append({
@@ -1125,7 +1519,6 @@ class MCPMarkAgent(BaseMCPAgent):
                                 "content": formatted_result
                             })
                         action_tool_executed = True
-                        tool_call_history.append(dict(tool_contexts_since_last_memory[-1]))
                         
                         # Format arguments for display (truncate if too long)
                         args_str = json.dumps(func_args, separators=(",", ": "))
@@ -1137,7 +1530,37 @@ class MCPMarkAgent(BaseMCPAgent):
                         if tool_call_log_file:
                             with open(tool_call_log_file, 'a', encoding='utf-8') as f:
                                 f.write(f"| {func_name} {args_str}\n")
-                                f.write(f"  Result: {formatted_result}\n")
+                                # Truncate result if too long (max 1000 chars)
+                                display_result = formatted_result[:1000] + "..." if len(formatted_result) > 1000 else formatted_result
+                                f.write(f"  Result: {display_result}\n")
+                    
+                    # Check if compression is needed for tool results from this turn
+                    compressed_contexts = await self._compress_tool_results_if_needed(
+                        tool_contexts_this_turn,
+                        instruction,
+                        latest_memory,
+                        all_messages,
+                        tool_call_log_file
+                    )
+                    
+                    # Update all data structures with final contexts (compressed or original)
+                    if compressed_contexts != tool_contexts_this_turn:
+                        # Compression occurred - update all_messages and append compressed contexts
+                        num_contexts = len(compressed_contexts)
+                        for i, compressed_ctx in enumerate(compressed_contexts):
+                            compressed_result = compressed_ctx.get("formatted_result")
+                            # Update the corresponding tool message
+                            tool_msg_idx = len(all_messages) - num_contexts + i
+                            if tool_msg_idx >= 0 and all_messages[tool_msg_idx].get("role") == "tool":
+                                all_messages[tool_msg_idx]["content"] = compressed_result
+                            # Append compressed context to accumulated lists
+                            tool_contexts_since_last_memory.append(compressed_ctx)
+                            tool_call_history.append(dict(compressed_ctx))
+                    else:
+                        # No compression - append original contexts to accumulated lists
+                        for ctx in tool_contexts_this_turn:
+                            tool_contexts_since_last_memory.append(ctx)
+                            tool_call_history.append(dict(ctx))
                 
                     # Update progress after tool results
                     messages_for_progress = [message_dict]
