@@ -65,6 +65,18 @@ class MCPMarkAgent(BaseMCPAgent):
     }
     # Compression threshold: trigger compression if tool results exceed this % of remaining budget
     COMPRESSION_THRESHOLD = 0.8
+    
+    # Thinking-aware system prompt for explicit reasoning tracking
+    THINKING_SYSTEM_PROMPT = (
+        "You are a helpful agent that uses tools iteratively to complete the user's task, and when finished, provides the final answer or simply states \"Task completed\" without further tool calls. For each tool call, also include a brief explanation in the message content describing what you are doing and why that tool is being called."
+        "CRITICAL RULES: "
+        "1. Strictly follow user instructions - no extra inference or reasoning unless explicitly requested. "
+        "2. For time-related tasks, use GMT+0800 (China Standard Time) if not specified. "
+        "3. Avoid redundant tool calls to improve efficiency. "
+        "4. Avoid read_multiple_files with many files - use parallel single reads instead. "
+        "5. Execute independent tool calls together (e.g., reading different files, creating separate directories)."
+    )
+    
     SYSTEM_PROMPT = (
         "You are a helpful agent that uses tools iteratively to complete the user's task, "
         "and when finished, provides the final answer or simply states \"Task completed\" without further tool calls. CRITICAL RULES: "
@@ -73,8 +85,10 @@ class MCPMarkAgent(BaseMCPAgent):
         "3. If memory contains VERIFIED CONSTRAINTS section, you MUST check it before each tool call and avoid violating those specific constraints. "
         "4. for time related tasks, if not specified, please use the time zone of GMT+0800 (China Standard Time). "
         "5. use code to solve problem if possible. "
-        "6. Avoid unnecessary redundantly calling to improve efficiency. "
-        "7. Critical: Avoid using read_multiple_files with too many files at once as it may exceed context limits. Read files in smaller one by one when dealing with large numbers of files."
+        "CRITICAL Notes:"
+        "1. Avoid unnecessary redundantly calling to improve efficiency. "
+        "2. Avoid using read_multiple_files with many files at once as it may exceed context limits, instead, read single file in parallel."
+        "3. When multiple tool calls are independent (e.g., reading different files, creating separate directories), execute them all together to improve efficiency."
     )
     MEMORY_SYSTEM_PROMPT = (
         "You own the shared task memory—call update_memory to keep it accurate. "
@@ -88,7 +102,6 @@ class MCPMarkAgent(BaseMCPAgent):
         "- Bullet list of the current plan or next steps; reorder or edit as understanding changes.\n"
         "- Ensure plan aligns strictly with user instructions: do not add goals or make extra inferences/reasoning unless it is explicitly requested.\n"
         "- The task instructions might have a few typos or ambiguities, you may discover and correct them based on tool call results.\n"
-        "- When planning file operations: read files one by one when dealing with large numbers of files to avoid context limits; extract all needed information in a single read; use head/tail parameters when only needing beginning/end of files.\n"
         "\n"
         "**PROGRESS & GAPS**\n"
         "- Finished: actions completed with tool confirmation.\n"
@@ -113,6 +126,36 @@ class MCPMarkAgent(BaseMCPAgent):
         "Rules: keep the memory concise yet precise, cite only tool-backed information or direct logical consequences. If nothing new was learned leave the memory unchanged."
     )
     VERIFICATION_SYSTEM_PROMPT = (
+        "You are a verification agent. Your role is to ensure the memory update correctly reflects recent tool outputs.\n"
+        "\n"
+        "**Primary Checks:**\n"
+        "\n"
+        "1. **Recent Tool Results Reflected**: Verify that information from recent tool calls is captured in the memory. "
+        "Check for missing information, incorrect values, or misinterpretations. "
+        "New findings should be integrated into the appropriate sections (PROGRESS, PERSISTENT FACTS, TASK PLAN).\n"
+        "\n"
+        "2. **Consistency**: Ensure no contradictions exist - "
+        "PROGRESS should align with PERSISTENT FACTS, "
+        "TASK PLAN should align with CONSTRAINTS and user instructions, "
+        "facts should not contradict each other or recent tool outputs.\n"
+        "\n"
+        "3. **Reasoning Correctness**: Verify that NEW interpretive claims added to memory are valid. "
+        "For new claims (e.g., 'X contains Y', dependencies, hierarchies), check if they are supported by recent tool outputs or valid logical deductions. "
+        "Existing claims from prior memory are assumed to have been previously verified - only flag them if they contradict new tool results.\n"
+        "\n"
+        "4. **Verified Constraints**: When discovering NEW errors from tool results, add them to VERIFIED CONSTRAINTS section:\n"
+        "   - Only add constraints explicitly violated or contradicted by tool results\n"
+        "   - Make constraints SPECIFIC with actual entity names, paths, IDs, values - no abstractions\n"
+        "   - Include: (1) specific instance that failed with actual names, (2) underlying rule explaining why\n"
+        "   - Preserve existing items from prior memory\n"
+        "\n"
+        "**Important**: The memory may contain accumulated statistics and progress from earlier turns that are NOT visible in current tool results. "
+        "This is normal and expected - do NOT flag or remove these unless they directly contradict new tool outputs.\n"
+        "\n"
+        "Call verify_memory with your analysis. If issues found, provide corrected version. "
+        "If no issues, return unchanged and acknowledge validity."
+    )
+    VERIFICATION_SYSTEM_PROMPT_OLD = (
         "You are a verification agent responsible for validating and correcting memory reports. "
         "Check the generated memory for:\n"
         "\n"
@@ -137,7 +180,7 @@ class MCPMarkAgent(BaseMCPAgent):
         "   - Create this section if it doesn't exist\n"
         "\n"
         "5. **DO NOT REMOVE EXECUTION GUIDANCE**: Do not remove operational instructions from TASK PLAN "
-        "that guide efficient execution (e.g., how to process files, batch sizes, parameters to use). "
+        "that guide efficient execution (e.g., how to process files, parameters to use). "
         "Keep them even if rewriting other sections, unless they directly contradict verified facts.\n"
         "\n"
         "Call verify_memory with your analysis. If issues found, provide corrected version. "
@@ -659,6 +702,9 @@ class MCPMarkAgent(BaseMCPAgent):
                 # return await self._execute_litellm_tool_loop(
                 #     instruction, functions, mcp_server, tool_call_log_file
                 # )
+                # return await self._execute_thinking_tool_loop(
+                #     instruction, functions, mcp_server, tool_call_log_file
+                # )
                 
         except Exception as e:
             logger.error(f"Manual MCP execution failed: {e}")
@@ -1036,7 +1082,7 @@ class MCPMarkAgent(BaseMCPAgent):
             return compressed_content
             
         except Exception as e:
-            logger.warning(f"| ⚠️  Compression failed for {file_path}: {e}. Using original.")
+            logger.warning(f"| ⚠️  Compression failed for {file_path}: {type(e).__name__}: {e}. Using original.")
             return file_content
 
     async def _compress_single_tool_result(
@@ -1162,7 +1208,7 @@ class MCPMarkAgent(BaseMCPAgent):
             return updated_context
             
         except Exception as e:
-            logger.error(f"| ✗ Compression failed for {tool_name}: {e}. Using original result.")
+            logger.error(f"| ✗ Compression failed for {tool_name}: {type(e).__name__}: {e}. Using original result.")
             return tool_context
 
     async def _compress_tool_results_if_needed(
@@ -1207,7 +1253,6 @@ class MCPMarkAgent(BaseMCPAgent):
         
         # Compression logic: check total tokens for this turn
         MIN_TOKENS_TO_COMPRESS = 5000  # Skip compression if turn total < 5000 tokens
-        LARGE_RESULT_THRESHOLD = 25000  # Always compress if turn total > 25000 tokens
         
         # Skip compression if total is too small
         if tool_results_tokens < MIN_TOKENS_TO_COMPRESS:
@@ -1217,7 +1262,7 @@ class MCPMarkAgent(BaseMCPAgent):
         # Check if compression is needed
         should_compress = False
         
-        if tool_results_tokens > LARGE_RESULT_THRESHOLD:
+        if tool_results_tokens > MIN_TOKENS_TO_COMPRESS:
             should_compress = True
         elif remaining_budget <= 0 or total_after_adding > context_limit:
             should_compress = True
@@ -1356,13 +1401,6 @@ class MCPMarkAgent(BaseMCPAgent):
                     completion_kwargs["reasoning_effort"] = self.reasoning_effort
                 if self.base_url:
                     completion_kwargs["base_url"] = self.base_url
-                
-                # DEBUG: Log what we're sending to LiteLLM
-                # logger.info(f"\n===== LITELLM CALL (Turn {turn_count + 1}) =====")
-                # logger.info(f"Tools: {len(completion_kwargs.get('tools', []))} tools available")
-                # logger.info(f"Tool choice: {completion_kwargs.get('tool_choice', 'not set')}")
-                # logger.info(f"Messages: {messages}")
-                # logger.info("===== END CALL INFO =====\n")
                 
                 try:
                     # Call OpenAI client or LiteLLM depending on model type
@@ -1522,7 +1560,7 @@ class MCPMarkAgent(BaseMCPAgent):
                         
                         # Format arguments for display (truncate if too long)
                         args_str = json.dumps(func_args, separators=(",", ": "))
-                        display_arguments = args_str[:140] + "..." if len(args_str) > 140 else args_str
+                        display_arguments = args_str[:250] + "..." if len(args_str) > 250 else args_str
                         
                         # Log with ANSI color codes (bold tool name, dim gray arguments)
                         logger.info(f"| \033[1m{func_name}\033[0m \033[2;37m{display_arguments}\033[0m")
@@ -2090,6 +2128,294 @@ class MCPMarkAgent(BaseMCPAgent):
             "litellm_run_model_name": self.litellm_run_model_name
         }
     
+
+
+    async def _execute_thinking_tool_loop(
+        self,
+        instruction: str,
+        functions: List[Dict],
+        mcp_server: Any,
+        tool_call_log_file: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Execute function calling loop with explicit thinking tracking.
+        
+        Differences from _execute_litellm_tool_loop:
+        1. Uses THINKING_SYSTEM_PROMPT instead of SYSTEM_PROMPT
+        2. Tracks thinking/reasoning from content field as separate messages
+        3. Message history structure: thinking → tool calls → tool results
+        4. Includes message compression (reuses existing compression methods)
+        """
+        messages = [
+            {"role": "system", "content": self.THINKING_SYSTEM_PROMPT},
+            {"role": "user", "content": instruction}
+        ]
+        total_tokens = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "reasoning_tokens": 0}
+        turn_count = 0
+        max_turns = self.MAX_TURNS
+        consecutive_failures = 0
+        max_consecutive_failures = 3
+        hit_turn_limit = False
+        ended_normally = False
+        
+        # Convert functions to tools format
+        tools = [{"type": "function", "function": func} for func in functions] if functions else None
+
+        if tool_call_log_file and tools:
+            max_name_length = max(
+                len(tool.get("function", {}).get("name", ""))
+                for tool in tools
+            ) if tools else 15
+            with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                f.write("===== Available Tools =====\n")
+                for tool in tools:
+                    function_info = tool.get("function", {})
+                    tool_name = function_info.get("name", "N/A")
+                    description = function_info.get("description", "N/A")
+                    f.write(f"- ToolName: {tool_name:<{max_name_length}} Description: {description}\n")
+                f.write("\n===== Execution Logs =====\n")
+
+        # Record initial state
+        self._update_progress(messages, total_tokens, turn_count)
+        
+        try:
+            while turn_count < max_turns:
+                
+                # Build completion kwargs
+                completion_kwargs = {
+                    "model": self.litellm_input_model_name,
+                    "messages": messages,
+                    "api_key": self.api_key,
+                }
+                
+                if tools:
+                    completion_kwargs["tools"] = tools
+                    completion_kwargs["tool_choice"] = "auto"
+                
+                if self.reasoning_effort != "default":
+                    completion_kwargs["reasoning_effort"] = self.reasoning_effort
+                if self.base_url:
+                    completion_kwargs["base_url"] = self.base_url
+                
+                try:
+                    response = await asyncio.wait_for(
+                        litellm.acompletion(**completion_kwargs),
+                        timeout=self.timeout / 2
+                    )
+                    consecutive_failures = 0
+                except asyncio.TimeoutError:
+                    logger.warning(f"| ✗ LLM call timed out on turn {turn_count + 1}")
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        raise Exception(f"Too many consecutive failures ({consecutive_failures})")
+                    await asyncio.sleep(8 ** consecutive_failures)
+                    continue
+                except Exception as e:
+                    logger.error(f"| ✗ LLM call failed on turn {turn_count + 1}: {e}")
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        raise
+                    if "ContextWindowExceededError" in str(e):
+                        raise
+                    elif "RateLimitError" in str(e):
+                        await asyncio.sleep(12 ** consecutive_failures)
+                    else:
+                        await asyncio.sleep(2 ** consecutive_failures)
+                    continue
+                
+                # Extract actual model name (first turn only)
+                if turn_count == 0 and hasattr(response, 'model') and response.model:
+                    self.litellm_run_model_name = response.model.split("/")[-1]
+                
+                # Update token usage
+                if hasattr(response, 'usage') and response.usage:
+                    input_tokens = response.usage.prompt_tokens or 0
+                    total_tokens_count = response.usage.total_tokens or 0
+                    output_tokens = total_tokens_count - input_tokens if total_tokens_count > 0 else (response.usage.completion_tokens or 0)
+                    
+                    total_tokens["input_tokens"] += input_tokens
+                    total_tokens["output_tokens"] += output_tokens
+                    total_tokens["total_tokens"] += total_tokens_count
+                    
+                    # Extract reasoning tokens if available
+                    if hasattr(response.usage, 'completion_tokens_details'):
+                        details = response.usage.completion_tokens_details
+                        if hasattr(details, 'reasoning_tokens'):
+                            total_tokens["reasoning_tokens"] += details.reasoning_tokens or 0
+                
+                # Get response message
+                choices = response.choices
+                if len(choices):
+                    message = choices[0].message
+                    message_dict = message.model_dump() if hasattr(message, 'model_dump') else dict(message)
+                
+                # Log thinking content if present
+                thinking_content = None
+                if hasattr(message, 'content') and message.content:
+                    thinking_content = message.content
+                    # Log thinking content
+                    logger.info(f"| 💭 [Thinking]")
+                    for line in message.content.splitlines():
+                        logger.info(f"| {line}")
+                    
+                    if tool_call_log_file:
+                        with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                            f.write(f"[THINKING]\n{message.content}\n\n")
+                
+                # Check for tool calls
+                if hasattr(message, 'tool_calls') and message.tool_calls:
+                    # Split thinking and tool calls into separate messages
+                    # 1. Add thinking as separate assistant message (if present)
+                    if thinking_content:
+                        messages.append({
+                            "role": "assistant",
+                            "content": thinking_content
+                        })
+                    
+                    # 2. Add tool calls message (without content to avoid duplication)
+                    tool_calls_message = message_dict.copy()
+                    tool_calls_message["content"] = None
+                    messages.append(tool_calls_message)
+                    turn_count += 1
+                    # Update progress after adding assistant message
+                    self._update_progress(messages, total_tokens, turn_count)
+                    
+                    # Process tool calls and collect contexts
+                    current_tool_contexts = []
+                    for tool_call in message.tool_calls:
+                        func_name = tool_call.function.name
+                        func_args = json.loads(tool_call.function.arguments)
+                        
+                        try:
+                            result = await asyncio.wait_for(
+                                mcp_server.call_tool(func_name, func_args),
+                                timeout=60
+                            )
+                            result_str = json.dumps(result)
+                            
+                            # Store context for potential compression
+                            current_tool_contexts.append({
+                                "id": tool_call.id,
+                                "name": func_name,
+                                "arguments": json.dumps(func_args),
+                                "result": result,
+                                "formatted_result": result_str
+                            })
+                            
+                        except asyncio.TimeoutError:
+                            error_msg = f"Tool call '{func_name}' timed out after 60 seconds"
+                            logger.error(error_msg)
+                            current_tool_contexts.append({
+                                "id": tool_call.id,
+                                "name": func_name,
+                                "arguments": json.dumps(func_args),
+                                "result": None,
+                                "formatted_result": f"Error: {error_msg}"
+                            })
+                        except Exception as e:
+                            logger.error(f"Tool call failed: {e}")
+                            current_tool_contexts.append({
+                                "id": tool_call.id,
+                                "name": func_name,
+                                "arguments": json.dumps(func_args),
+                                "result": None,
+                                "formatted_result": f"Error: {str(e)}"
+                            })
+                        
+                        # Format and log tool call
+                        args_str = json.dumps(func_args, separators=(",", ": "))
+                        display_arguments = args_str[:140] + "..." if len(args_str) > 140 else args_str
+                        logger.info(f"| \033[1m{func_name}\033[0m \033[2;37m{display_arguments}\033[0m")
+                        
+                        if tool_call_log_file:
+                            with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                                f.write(f"| {func_name} {args_str}\n")
+                    
+                    # Apply compression if needed (only compresses formatted_result field)
+                    contexts_to_add = current_tool_contexts
+                    if current_tool_contexts:
+                        compressed_contexts = await self._compress_tool_results_if_needed(
+                            current_tool_contexts,
+                            instruction,
+                            "",  # No memory in this simplified version
+                            messages,
+                            tool_call_log_file
+                        )
+                        
+                        if compressed_contexts:
+                            # Use compressed versions (formatted_result is already compressed)
+                            contexts_to_add = compressed_contexts
+                    
+                    # Now add tool result messages (with compressed content if applicable)
+                    for ctx in contexts_to_add:
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": ctx["id"],
+                            "content": ctx.get("formatted_result") or str(ctx.get("result", ""))
+                        })
+                    
+                    # Update progress after adding all tool results
+                    self._update_progress(messages, total_tokens, turn_count)
+                    continue
+                else:
+                    # No tool calls - task complete
+                    if not choices:
+                        logger.info("|\n|\n| Task ended with no messages generated by the model.")
+                    elif choices[0].finish_reason == "stop":
+                        logger.info("|\n|\n| Task ended with the finish reason from messages being 'stop'.")
+                    
+                    messages.append(message_dict)
+                    turn_count += 1
+                    self._update_progress(messages, total_tokens, turn_count)
+                    ended_normally = True
+                    break
+                
+        except Exception as loop_error:
+            logger.error(f"Thinking tool loop failed: {loop_error}", exc_info=True)
+            sdk_format_messages = self._convert_to_sdk_format(messages)
+            return {
+                "success": False,
+                "output": sdk_format_messages,
+                "token_usage": total_tokens,
+                "turn_count": turn_count,
+                "error": str(loop_error),
+                "litellm_run_model_name": self.litellm_run_model_name,
+            }
+        
+        # Check if we hit turn limit
+        if (not ended_normally) and (turn_count >= max_turns):
+            hit_turn_limit = True
+            logger.warning(f"| Max turns ({max_turns}) exceeded; returning failure with partial output.")
+            if tool_call_log_file:
+                try:
+                    with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                        f.write(f"| Max turns ({max_turns}) exceeded\n")
+                except Exception:
+                    pass
+
+        # Display final token usage
+        if total_tokens["total_tokens"] > 0:
+            log_msg = (
+                f"| Token usage: Total: {total_tokens['total_tokens']:,} | "
+                f"Input: {total_tokens['input_tokens']:,} | "
+                f"Output: {total_tokens['output_tokens']:,}"
+            )
+            if total_tokens.get("reasoning_tokens", 0) > 0:
+                log_msg += f" | Reasoning: {total_tokens['reasoning_tokens']:,}"
+            logger.info(log_msg)
+            logger.info(f"| Turns: {turn_count}")
+        
+        # Convert messages to SDK format
+        sdk_format_messages = self._convert_to_sdk_format(messages)
+        
+        return {
+            "success": not hit_turn_limit,
+            "output": sdk_format_messages,
+            "token_usage": total_tokens,
+            "turn_count": turn_count,
+            "error": (f"Max turns ({max_turns}) exceeded" if hit_turn_limit else None),
+            "litellm_run_model_name": self.litellm_run_model_name
+        }
 
 
     # ==================== Format Conversion Methods ====================
