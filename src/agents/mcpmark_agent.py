@@ -126,34 +126,27 @@ class MCPMarkAgent(BaseMCPAgent):
         "Rules: keep the memory concise yet precise, cite only tool-backed information or direct logical consequences. If nothing new was learned leave the memory unchanged."
     )
     VERIFICATION_SYSTEM_PROMPT = (
-        "You are a verification agent. Your role is to ensure the memory update correctly reflects recent tool outputs.\n"
+        "You are a verification agent ensuring memory updates accurately reflect recent tool results.\n"
         "\n"
-        "**Primary Checks:**\n"
+        "**Your Responsibilities:**\n"
         "\n"
-        "1. **Recent Tool Results Reflected**: Verify that information from recent tool calls is captured in the memory. "
-        "Check for missing information, incorrect values, or misinterpretations. "
-        "New findings should be integrated into the appropriate sections (PROGRESS, PERSISTENT FACTS, TASK PLAN).\n"
+        "1. **Accuracy**: Verify facts match tool outputs (values, IDs, counts, properties)\n"
+        "2. **Completeness**: Check that relevant tool results are captured\n"
+        "3. **Consistency**: Ensure no contradictions between sections or with tool outputs\n"
+        "4. **Reasoning**: Validate that interpretive claims are supported by evidence\n"
         "\n"
-        "2. **Consistency**: Ensure no contradictions exist - "
-        "PROGRESS should align with PERSISTENT FACTS, "
-        "TASK PLAN should align with CONSTRAINTS and user instructions, "
-        "facts should not contradict each other or recent tool outputs.\n"
+        "**Critical**: The memory may contain accumulated statistics and progress from earlier turns "
+        "that are NOT visible in current tool results. This is normal and expected - do NOT flag or "
+        "remove these unless they directly contradict new tool outputs. Do not call tools to re-verify those facts as well.\n"
         "\n"
-        "3. **Reasoning Correctness**: Verify that NEW interpretive claims added to memory are valid. "
-        "For new claims (e.g., 'X contains Y', dependencies, hierarchies), check if they are supported by recent tool outputs or valid logical deductions. "
-        "Existing claims from prior memory are assumed to have been previously verified - only flag them if they contradict new tool results.\n"
+        "**Process:**\n"
         "\n"
-        "4. **Verified Constraints**: When discovering NEW errors from tool results, add them to VERIFIED CONSTRAINTS section:\n"
-        "   - Only add constraints explicitly violated or contradicted by tool results\n"
-        "   - Make constraints SPECIFIC with actual entity names, paths, IDs, values - no abstractions\n"
-        "   - Include: (1) specific instance that failed with actual names, (2) underlying rule explaining why\n"
-        "   - Preserve existing items from prior memory\n"
-        "\n"
-        "**Important**: The memory may contain accumulated statistics and progress from earlier turns that are NOT visible in current tool results. "
-        "This is normal and expected - do NOT flag or remove these unless they directly contradict new tool outputs.\n"
-        "\n"
-        "Call verify_memory with your analysis. If issues found, provide corrected version. "
-        "If no issues, return unchanged and acknowledge validity."
+        "- If you need to verify uncertain facts, call relevant tools to check\n"
+        "- After gathering necessary information, call verify_memory with:\n"
+        "  * verified_report: the verified (and corrected if needed) memory\n"
+        "  * issues_found (optional): brief description of any corrections made, for tracking purposes\n"
+        "- When verification tool calls reveal NEW information, incorporate it into the verified memory\n"
+        "- The memory should reflect ALL tool results from both action phase and verification phase"
     )
     VERIFICATION_SYSTEM_PROMPT_OLD = (
         "You are a verification agent responsible for validating and correcting memory reports. "
@@ -696,15 +689,21 @@ class MCPMarkAgent(BaseMCPAgent):
                 functions = self._convert_to_openai_format(tools)
                 
                 # Execute with function calling loop
-                return await self._execute_two_phase_tool_loop(
-                    instruction, functions, mcp_server, tool_call_log_file
-                )
+                # return await self._execute_two_phase_tool_loop(
+                #     instruction, functions, mcp_server, tool_call_log_file
+                # )
+                # return await self._execute_mdp_tool_loop(
+                #     instruction, functions, mcp_server, tool_call_log_file
+                # )
                 # return await self._execute_litellm_tool_loop(
                 #     instruction, functions, mcp_server, tool_call_log_file
                 # )
                 # return await self._execute_thinking_tool_loop(
                 #     instruction, functions, mcp_server, tool_call_log_file
                 # )
+                return await self._execute_multi_agent_tool_loop(
+                        instruction, functions, mcp_server, tool_call_log_file
+                    )
                 
         except Exception as e:
             logger.error(f"Manual MCP execution failed: {e}")
@@ -739,9 +738,10 @@ class MCPMarkAgent(BaseMCPAgent):
         return {
             "name": "verify_memory",
             "description": (
-                "Verify and potentially correct the generated memory report. "
-                "Check for correctness of facts, logical consistency, completeness, reasoning validity, and format. "
-                "Return the verified(corrected if needed) memory."
+                "Finalize the verified memory report after all necessary checks. "
+                "Only call this when you have sufficient information to verify the memory. "
+                "If you need to check facts, call appropriate tools first. "
+                "Include any NEW information discovered during verification in the verified report."
             ),
             "parameters": {
                 "type": "object",
@@ -749,19 +749,220 @@ class MCPMarkAgent(BaseMCPAgent):
                     "verified_report": {
                         "type": "string",
                         "description": (
-                            "The verified and potentially corrected memory report following the same structure."
+                            "The verified and potentially corrected memory report following the same structure. "
+                            "Must incorporate information from any verification tool calls."
                         )
                     },
                     "issues_found": {
                         "type": "string",
                         "description": (
-                            "Brief description of any issues found and corrections made, or 'None' if memory was correct."
+                            "Optional: Brief description of any corrections made during verification, for tracking purposes. "
+                            "Can be omitted or 'None' if memory was correct."
                         )
                     }
                 },
-                "required": ["verified_report", "issues_found"]
+                "required": ["verified_report"]
             }
         }
+    
+    async def _execute_verification_loop(
+        self,
+        instruction: str,
+        latest_memory: str,
+        tool_contexts_since_last_memory: List[Dict[str, Any]],
+        functions: List[Dict],
+        mcp_server: Any,
+        tool_call_log_file: Optional[str],
+        _record_usage: Callable
+    ) -> str:
+        """
+        Execute verification loop with tool calling capability.
+        
+        Args:
+            instruction: Original task instruction
+            latest_memory: Unverified memory to check
+            tool_contexts_since_last_memory: Tool results from action phase
+            functions: Available MCP tools
+            mcp_server: MCP server instance
+            tool_call_log_file: Log file path
+            _record_usage: Function to record token usage
+            
+        Returns:
+            verified_memory: The verified (and potentially corrected) memory report.
+            
+        Note: Verification tool calls are logged but not returned, as the memory
+        itself is the source of truth and should contain all relevant information.
+        """
+        
+        verification_tool_def = self._create_verify_memory_tool()
+        verification_tool = {"type": "function", "function": verification_tool_def}
+        action_tools = [{"type": "function", "function": f} for f in functions] if functions else []
+        all_verification_tools = action_tools + [verification_tool]
+        
+        # Track tool calls made during verification (to add to history)
+        verification_tool_contexts: List[Dict[str, Any]] = []
+        
+        # Build initial messages: task + memory + action tool results
+        verification_messages = self._build_messages_with_context(
+            instruction=instruction,
+            latest_memory=latest_memory,
+            last_tool_contexts=tool_contexts_since_last_memory,
+            mode="verify"
+        )
+        
+        max_verification_turns = 5
+        verification_turn = 0
+        
+        while verification_turn < max_verification_turns:
+            verification_turn += 1
+            logger.info(f"🔍 Verification turn {verification_turn}/{max_verification_turns}")
+            
+            kwargs = {
+                "model": self.litellm_input_model_name,
+                "messages": verification_messages,
+                "api_key": self.api_key,
+                "tools": all_verification_tools,
+                "tool_choice": "auto",
+            }
+            
+            if self.reasoning_effort != "default":
+                kwargs["reasoning_effort"] = self.reasoning_effort
+            if self.base_url:
+                kwargs["base_url"] = self.base_url
+            
+            try:
+                if self._openai_client:
+                    response = await asyncio.wait_for(
+                        self._openai_client.acompletion(
+                            messages=verification_messages,
+                            tools=kwargs.get("tools"),
+                            tool_choice=kwargs.get("tool_choice"),
+                        ),
+                        timeout=self.timeout / 2
+                    )
+                else:
+                    response = await asyncio.wait_for(
+                        litellm.acompletion(**kwargs),
+                        timeout=self.timeout / 2
+                    )
+            except asyncio.TimeoutError:
+                logger.warning("| ✗ Verification call timed out; using unverified memory")
+                return latest_memory
+            except Exception as e:
+                logger.error(f"| ✗ Verification call failed: {e}; using unverified memory")
+                return latest_memory
+            
+            _record_usage(response)  # Track tokens
+            
+            message = response.choices[0].message
+            message_dict = message.model_dump() if hasattr(message, 'model_dump') else dict(message)
+            
+            if not (hasattr(message, 'tool_calls') and message.tool_calls):
+                logger.warning("| Verification returned no tool calls; using unverified memory")
+                return latest_memory
+            
+            # Add assistant message to verification history
+            verification_messages.append(message_dict)
+            
+            # Process tool calls
+            verify_memory_called = False
+            action_tools_called = False
+            
+            for tool_call in message.tool_calls:
+                func_name = tool_call.function.name
+                func_args = json.loads(tool_call.function.arguments)
+                
+                if func_name == "verify_memory":
+                    # Verification complete!
+                    verify_memory_called = True
+                    verified_memory = func_args.get("verified_report", latest_memory)
+                    issues_found = func_args.get("issues_found", "None")
+                    
+                    # Log based on whether issues were found
+                    if issues_found and issues_found.lower() not in ["none", ""]:
+                        logger.info(f"🔧 Memory verified with corrections after {verification_turn} turn(s): {issues_found[:100]}{'...' if len(issues_found) > 100 else ''}")
+                    else:
+                        logger.info(f"✅ Memory verified (no issues) after {verification_turn} turn(s)")
+                    
+                    if tool_call_log_file:
+                        with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                            f.write(f"| verify_memory (after {verification_turn} turn(s))\n")
+                            f.write(f"  Issues Found: {issues_found}\n")
+                            if verification_tool_contexts:
+                                f.write(f"  Additional tool calls during verification: {len(verification_tool_contexts)}\n")
+                                for ctx in verification_tool_contexts:
+                                    f.write(f"    - {ctx['name']}\n")
+                            f.write(f"[Verified Memory]: \n{verified_memory}\n")
+                    
+                    return verified_memory
+                
+                else:
+                    # Action tool called for fact-checking
+                    action_tools_called = True
+                    
+                    logger.info(f"🔍 Verification checking: {func_name}")
+                    
+                    try:
+                        result = await asyncio.wait_for(
+                            mcp_server.call_tool(func_name, func_args),
+                            timeout=60
+                        )
+                        formatted_result = self._format_tool_result_for_model(result, func_name)
+                        
+                        # Store context for later addition to main history
+                        tool_context = {
+                            "name": func_name,
+                            "result": result,
+                            "formatted_result": formatted_result,
+                            "id": tool_call.id,
+                            "arguments": json.dumps(func_args, separators=(",", ": "))
+                        }
+                        verification_tool_contexts.append(tool_context)
+                        
+                        # Add to verification message history
+                        verification_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": formatted_result
+                        })
+                        
+                        if tool_call_log_file:
+                            args_str = json.dumps(func_args, separators=(",", ": "))
+                            with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                                f.write(f"| [verification] {func_name} {args_str}\n")
+                                display_result = formatted_result[:500] + "..." if len(formatted_result) > 500 else formatted_result
+                                f.write(f"  Result: {display_result}\n")
+                        
+                    except asyncio.TimeoutError:
+                        error_msg = f"Tool call '{func_name}' timed out after 60 seconds"
+                        logger.error(f"| ✗ {error_msg}")
+                        verification_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": f"Error: {error_msg}"
+                        })
+                    except Exception as e:
+                        logger.error(f"| ✗ Verification tool call '{func_name}' failed: {e}")
+                        error_msg = f"Error: {str(e)}"
+                        verification_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": error_msg
+                        })
+            
+            # If action tools were called, continue loop for re-verification
+            if action_tools_called:
+                logger.info(f"🔄 Re-verifying with {len(verification_tool_contexts)} additional tool result(s)")
+                continue
+            
+            # If we got here without verify_memory being called, something went wrong
+            if not verify_memory_called:
+                logger.warning("| Unexpected: no verify_memory call found; using unverified memory")
+                return latest_memory
+        
+        # Hit max iterations
+        logger.warning(f"⚠️  Verification hit max iterations ({max_verification_turns}); using unverified memory")
+        return latest_memory
     
     def _build_messages_with_context(
         self,
@@ -1063,7 +1264,7 @@ class MCPMarkAgent(BaseMCPAgent):
             
             response = await asyncio.wait_for(
                 litellm.acompletion(**completion_kwargs),
-                timeout=60
+                timeout=300  # 5 minutes for large files
             )
             
             if response.choices and len(response.choices) > 0:
@@ -1116,18 +1317,38 @@ class MCPMarkAgent(BaseMCPAgent):
             try:
                 # Parse individual files
                 files = self._parse_read_multiple_files_result(original_result)
-                logger.info(f"| 📄 Detected read_multiple_files with {len(files)} files. Compressing individually...")
+                logger.info(f"| 📄 Detected read_multiple_files with {len(files)} files. Compressing in parallel...")
                 
-                # Compress each file
-                compressed_files = []
-                for file_info in files:
-                    compressed_content = await self._compress_single_file_content(
+                # Compress each file in parallel
+                compression_tasks = [
+                    self._compress_single_file_content(
                         file_info['path'],
                         file_info['content'],
                         instruction,
                         tool_call_log_file
                     )
-                    compressed_files.append(f"{file_info['path']}:\n{compressed_content}")
+                    for file_info in files
+                ]
+                
+                # Execute compression in parallel with timeout
+                try:
+                    compressed_contents = await asyncio.wait_for(
+                        asyncio.gather(*compression_tasks, return_exceptions=True),
+                        timeout=900  # 10 minutes max for all files
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"| ✗ Parallel compression timeout for read_multiple_files. Using original.")
+                    # Fall through to normal compression which will also likely fail, but at least we tried
+                    raise
+                
+                # Build compressed files list, handling any errors
+                compressed_files = []
+                for file_info, compressed_content in zip(files, compressed_contents):
+                    if isinstance(compressed_content, Exception):
+                        logger.warning(f"| ⚠️  Failed to compress {file_info['path']}: {compressed_content}. Using original.")
+                        compressed_files.append(f"{file_info['path']}:\n{file_info['content']}")
+                    else:
+                        compressed_files.append(f"{file_info['path']}:\n{compressed_content}")
                 
                 # Reassemble result
                 final_compressed = "\n\n".join(compressed_files)
@@ -1177,7 +1398,7 @@ class MCPMarkAgent(BaseMCPAgent):
             
             response = await asyncio.wait_for(
                 litellm.acompletion(**completion_kwargs),
-                timeout=60
+                timeout=300  # 5 minutes for large results
             )
             
             # Extract compressed content
@@ -1279,16 +1500,36 @@ class MCPMarkAgent(BaseMCPAgent):
             with open(tool_call_log_file, 'a', encoding='utf-8') as f:
                 f.write(f"\n[COMPRESSION TRIGGERED] Current: {tool_results_tokens}, Remaining: {remaining_budget}, Limit: {context_limit}\n")
         
-        # Compress all tool results in parallel
-        logger.info(f"| 🔄 Compressing {len(tool_contexts)} result(s) in parallel...")
+        # Per-tool compression threshold: only compress individual results >= 500 tokens
+        MIN_TOKENS_PER_TOOL_TO_COMPRESS = 500
         
-        compression_tasks = [
-            self._compress_single_tool_result(ctx, instruction, latest_memory, tool_call_log_file)
-            for ctx in tool_contexts
-        ]
+        # Identify which tool results need compression (>= 500 tokens each)
+        compression_tasks = []
+        indices_to_compress = []
+        
+        for i, ctx in enumerate(tool_contexts):
+            result_text = ctx.get("formatted_result", "")
+            result_tokens = self._estimate_tokens(result_text)
+            
+            if result_tokens >= MIN_TOKENS_PER_TOOL_TO_COMPRESS:
+                # This result needs compression
+                compression_tasks.append(
+                    self._compress_single_tool_result(ctx, instruction, latest_memory, tool_call_log_file)
+                )
+                indices_to_compress.append(i)
+                logger.info(f"| 🔄 Will compress result {i} ({result_tokens} tokens)")
+            else:
+                # Keep small results as-is
+                logger.info(f"| ✓ Keeping result {i} as-is ({result_tokens} tokens < {MIN_TOKENS_PER_TOOL_TO_COMPRESS})")
+        
+        if not compression_tasks:
+            logger.info(f"| ✓ All individual results below per-tool threshold ({MIN_TOKENS_PER_TOOL_TO_COMPRESS}). No compression needed.")
+            return tool_contexts
+        
+        logger.info(f"| 🔄 Compressing {len(compression_tasks)}/{len(tool_contexts)} result(s) in parallel...")
         
         try:
-            compressed_contexts = await asyncio.wait_for(
+            compressed_results = await asyncio.wait_for(
                 asyncio.gather(*compression_tasks, return_exceptions=True),
                 timeout=300  # 5 minutes max for all compressions
             )
@@ -1296,13 +1537,19 @@ class MCPMarkAgent(BaseMCPAgent):
             logger.error(f"| ✗ Compression timeout after 300s. Using original results.")
             return tool_contexts
         
-        # Handle any individual compression failures
-        for i, result in enumerate(compressed_contexts):
-            if isinstance(result, Exception):
-                logger.error(f"| ✗ Compression failed for result {i}: {type(result).__name__}. Using original.")
-                compressed_contexts[i] = tool_contexts[i]
+        # Build final contexts list: use compressed for large results, keep original for small ones
+        final_contexts = list(tool_contexts)  # Start with all original
         
-        return compressed_contexts
+        for compressed_idx, original_idx in enumerate(indices_to_compress):
+            result = compressed_results[compressed_idx]
+            if isinstance(result, Exception):
+                logger.error(f"| ✗ Compression failed for result {original_idx}: {type(result).__name__}. Using original.")
+                # Keep original (already in final_contexts)
+            else:
+                # Replace with compressed version
+                final_contexts[original_idx] = result
+        
+        return final_contexts
 
     async def _execute_two_phase_tool_loop(
         self,
@@ -1611,8 +1858,7 @@ class MCPMarkAgent(BaseMCPAgent):
                     # Decide if we should update memory based on accumulated tool calls
                     should_update_memory = (
                         action_tool_executed and (
-                            turn_count <= 3  # First 3 turns always update
-                            or len(tool_contexts_since_last_memory) >= self.memory_update_threshold
+                            len(tool_contexts_since_last_memory) >= self.memory_update_threshold
                             or turn_count >= max_turns - 5  # Near end always update
                             or has_critical_tools  # Critical tools always trigger memory update
                         )
@@ -1717,104 +1963,25 @@ class MCPMarkAgent(BaseMCPAgent):
                         })
                         
                         # === VERIFICATION PHASE ===
-                        # Now verify the generated memory
-                        verification_tool_def = self._create_verify_memory_tool()
-                        verification_tool = {"type": "function", "function": verification_tool_def}
-                        
-                        verification_messages = self._build_messages_with_context(
+                        # Now verify the generated memory with iterative tool calling
+                        verified_memory = await self._execute_verification_loop(
                             instruction=instruction,
                             latest_memory=latest_memory,
-                            last_tool_contexts=tool_contexts_since_last_memory,
-                            mode="verify"
+                            tool_contexts_since_last_memory=tool_contexts_since_last_memory,
+                            functions=functions,
+                            mcp_server=mcp_server,
+                            tool_call_log_file=tool_call_log_file,
+                            _record_usage=_record_usage
                         )
                         
-                        verification_kwargs = {
-                            "model": self.litellm_input_model_name,
-                            "messages": verification_messages,
-                            "api_key": self.api_key,
-                            "tools": [verification_tool],
-                            "tool_choice": {
-                                "type": "function",
-                                "function": {"name": "verify_memory"}
-                            }
-                        }
-                        
-                        if self.reasoning_effort != "default":
-                            verification_kwargs["reasoning_effort"] = self.reasoning_effort
-                        if self.base_url:
-                            verification_kwargs["base_url"] = self.base_url
-                        
-                        logger.info(f"verify_memory call")
-                        
-                        try:
-                            if self._openai_client:
-                                verification_response = await asyncio.wait_for(
-                                    self._openai_client.acompletion(
-                                        messages=verification_messages,
-                                        tools=verification_kwargs.get("tools"),
-                                        tool_choice=verification_kwargs.get("tool_choice"),
-                                    ),
-                                    timeout=self.timeout / 2
-                                )
-                            else:
-                                verification_response = await asyncio.wait_for(
-                                    litellm.acompletion(**verification_kwargs),
-                                    timeout=self.timeout / 2
-                                )
-                            consecutive_failures = 0
-                        except asyncio.TimeoutError:
-                            logger.warning("| ✗ Verification call timed out; using unverified memory")
-                            continue
-                        except Exception as e:
-                            logger.error(f"| ✗ Verification call failed: {e}; using unverified memory")
-                            continue
-                        
-                        _record_usage(verification_response)
-                        
-                        verification_choices = verification_response.choices
-                        if not len(verification_choices):
-                            logger.error("| Verification call returned no choices; using unverified memory")
-                            continue
-                        
-                        verification_message = verification_choices[0].message
-                        verification_message_dict = verification_message.model_dump() if hasattr(verification_message, 'model_dump') else dict(verification_message)
-                        
-                        if not hasattr(verification_message, 'tool_calls') or not verification_message.tool_calls:
-                            logger.error("| Verification call did not return verify_memory tool call; using unverified memory")
-                            continue
-                        
-                        all_messages.append(verification_message_dict)
-                        
-                        # Extract verified memory from the single tool call
-                        verify_tool_call = verification_message.tool_calls[0]
-                        verify_func_args = json.loads(verify_tool_call.function.arguments)
-                        
-                        verified_memory = verify_func_args.get("verified_report", latest_memory)
-                        issues_found = verify_func_args.get("issues_found", "Unknown")
-                        
-                        # Replace latest_memory with verified version
+                        # Update memory with verified version
                         latest_memory = verified_memory
                         
-                        if issues_found.lower() == "none":
-                            logger.info(f"✅ Memory verified (no issues): {verified_memory[:200]}{'...' if len(verified_memory) > 200 else ''}")
-                        else:
-                            logger.info(f"🔧 Memory verified with corrections: {issues_found[:100]}{'...' if len(issues_found) > 100 else ''}")
-                            logger.info(f"✅ Corrected Memory: {verified_memory[:200]}{'...' if len(verified_memory) > 200 else ''}")
+                        # Display verified memory summary
+                        logger.info(f"✅ Verified Memory: {verified_memory[:200]}{'...' if len(verified_memory) > 200 else ''}")
                         
-                        if tool_call_log_file:
-                            with open(tool_call_log_file, 'a', encoding='utf-8') as f:
-                                f.write(f"| verify_memory\n")
-                                f.write(f"  Issues Found: {issues_found}\n")
-                                f.write(f"  Verified Memory: {verified_memory}\n")
-                        
-                        all_messages.append({
-                            "role": "tool",
-                            "tool_call_id": verify_tool_call.id,
-                            "content": f"Memory verified. Issues: {issues_found}"
-                        })
-                        
-                        # Update progress with memory and verification responses
-                        self._update_progress([memory_message_dict, verification_message_dict], total_tokens, turn_count)
+                        # Update progress - Note: verification responses are tracked internally in the loop
+                        self._update_progress([memory_message_dict], total_tokens, turn_count)
                         
                         # Reset accumulated contexts after successful memory update
                         # (tool_call_history is kept for action LLM's full context)
@@ -2533,4 +2700,2406 @@ class MCPMarkAgent(BaseMCPAgent):
         
         else:
             raise ValueError(f"Unsupported HTTP service: {self.mcp_service}")
+    
+    # ==================== MDP-based Execution Loop ====================
+    
+    def _build_verification_mdp_prompt(
+        self,
+        task: str,
+        tools: List[Dict],
+        verification_report: str,
+        last_actions: str
+    ) -> str:
+        """Build prompt for verification agent's MDP loop."""
+        # Format tools
+        descriptions = []
+        for tool in tools:
+            function_info = tool.get("function", {})
+            name = function_info.get("name", "N/A")
+            description = function_info.get("description", "N/A")
+            parameters = function_info.get("parameters", {})
+            properties = parameters.get("properties", {}) or {}
+            required = set(parameters.get("required", []) or [])
+            
+            arg_lines = []
+            for prop_name, prop_details in properties.items():
+                details = json.dumps(prop_details, ensure_ascii=False, indent=2)
+                suffix = " (required)" if prop_name in required else ""
+                arg_lines.append(f"- {prop_name}{suffix}: {details}")
+            
+            if arg_lines:
+                arguments_text = "\n".join(arg_lines)
+            else:
+                arguments_text = "(no arguments)"
+            
+            descriptions.append(
+                f"Tool: {name}\nDescription: {description}\nArguments:\n{arguments_text}"
+            )
+        
+        tools_description = "\n\n".join(descriptions) if descriptions else "(no tools available)"
+        
+        prompt = f"""You are a meticulous task verification agent. Your role is to verify whether a task has been completed correctly and completely by inspecting the actual environment state.
+
+## CRITICAL OUTPUT FORMAT REQUIREMENTS
+
+You MUST follow this exact format. Every response must contain:
+
+1. <report>...</report> (always required)
+2. Either <answer>...</answer> OR <tool_calls>...</tool_calls> (never both)
+
+## Input Format
+
+- **Original Task**: The task that the main agent was asked to complete
+- **Your Previous Verification Progress**: Your accumulated verification findings so far
+- **Your Last Inspection Actions & Results**: The tools you called in the previous round with their results combined (in `<tool_calls_and_results>` tag)
+
+## Output Format
+
+<report>
+
+### Verification Progress
+
+Document what you've verified so far:
+- **Allowed root directory** (MUST check this FIRST via list_allowed_directories)
+- What you've inspected and how
+- Evidence gathered (with tool results)
+- Preliminary findings
+- What still needs checking
+- Expected final deliverables.
+
+**CRITICAL**: You may adjust the deliverables based on the actual allowed root directory.
+
+This section should accumulate and build upon previous verification steps.
+
+### Next Steps Plan
+
+What inspection actions to take next, or if ready to conclude.
+
+</report>
+
+**Decision Point**: Are you ready to conclude verification?
+
+**If YES - Verification Complete with NO ISSUES:**
+
+<answer>
+Task Verification Passed
+
+Summary: [brief summary of what was verified]
+</answer>
+
+**If YES - Verification Complete with ISSUES FOUND:**
+
+<answer>
+VERIFICATION FAILED
+
+Issues discovered:
+
+1. **[Issue Category]**: [Specific issue with evidence]
+   - Expected: [what should be]
+   - Actual: [what was found]
+   - Evidence: [tool result or inspection details]
+
+2. **[Issue Category]**: [Another specific issue]
+   ...
+
+</answer>
+
+**If NO - Need more inspection:**
+
+<tool_calls>
+[Tool calls in valid JSON format to gather more evidence]
+</tool_calls>
+
+Example:
+<tool_calls>
+[{{"name": "list_directory", "arguments": {{"path": "/some/path"}}}}, {{"name": "read_file", "arguments": {{"path": "/some/file.txt"}}}}]
+</tool_calls>
+
+## Your Mission
+
+The main agent has claimed to complete a task. You must:
+1. **Systematically verify** the work by inspecting the actual environment
+2. **Check all requirements** from the original task
+3. **Identify any issues**: missing items, incorrect results, schema violations, or unwanted side effects
+4. **Use tools iteratively** to gather evidence and build confidence in your assessment
+
+**IMPORTANT**: Your role is to VERIFY the output, NOT to re-solve the task.
+- For complex analytical tasks: Just verify the OUTPUT is complete and correct
+- For file operations: Check files exist, content matches requirements, formats are correct
+- For data tasks: Verify results are present, accurate, and match expected schemas
+- **DO NOT** redo the entire analysis or regenerate solutions yourself
+- **FOCUS** on checking what was produced against what was required
+
+## Critical Constraints
+
+**READ-ONLY MODE**: You can ONLY inspect and read. You MUST NOT modify anything in the environment even though all tools are available to you.
+
+## Verification Strategy
+
+1. **Identify requirements**: What outputs/results were required by the task?
+2. **Inspect actual outputs**: Use tools to read/check what was actually produced
+3. **Compare**: Does actual output match requirements? (completeness, correctness, format)
+4. **Check for issues**: Missing items, incorrect data, wrong formats, unwanted extras
+5. **Iterate if needed**: Gather more evidence if uncertain
+6. **Conclude**: Pass or fail with specific findings
+
+Be thorough but efficient. Verify outputs with actual inspection, not assumptions. Don't re-solve the task.
+
+## Input Context
+
+### Original Task
+{task}
+
+### Available Tools
+{tools_description}
+
+### Your Previous Verification Progress
+<report>
+{verification_report}
+</report>
+
+### Your Last Inspection Actions & Results
+
+⚠️ Check if you already verified this information before calling the same tools again!
+
+<tool_calls_and_results>
+{last_actions}
+</tool_calls_and_results>
+
+## Guidelines
+
+- **Verify outputs, don't re-solve**: Check what was produced, don't redo the task yourself
+- **Be systematic**: Check each requirement methodically
+- **Be skeptical**: Verify claims with actual inspection
+- **Be specific**: Issues must include evidence and be actionable
+- **Be fair**: Don't fail for trivial or subjective issues
+- **Be efficient**: For complex analysis tasks, focus on output completeness/correctness
+- **Be thorough**: But know when you have enough evidence
+- **Remember**: You can iterate - use multiple inspection rounds if needed
+- **READ-ONLY**: Never modify, only inspect
+- **First turn**: Explore the allowed workspace first before operating on any paths.
+- **Evidence usage**: Confirm the agent actually inspected key files/data sources.
+- **Spec fidelity**: Check that the agent followed the task’s rules as written and did not introduce its own decision policies.
+- **Exactness & format**: For tasks involving exact content, indices, or strict formats, verify the result is precise and matches the required schema / naming style.
+
+## IMPORTANT: Common Verification Pitfalls - CHECK THESE CAREFULLY
+
+**Example 1: Wrong Directory Structure**
+- Task mentions directory name as context (e.g., "in test directory, write answer") → This is NOT an instruction to create that directory literally
+- Check: Between allowed root and actual work, is there an extra directory matching task's reference name?
+- Example: Allowed root is `/root/`, task mentions "test" → Correct: `/root/answer.txt`, WRONG: `/root/test/answer.txt`
+- Verify: List allowed root, check if unnecessary wrapper directory was created matching task's reference name
+
+**Example 2: Unauthorized Side Effects**
+- Task says "create directory X" → Check if agent created OTHER directories/files too
+- Verify: List all files/directories to detect unwanted extras
+
+**Example 3: Avoid overthinking**
+- If task specifcies specific operation, such as de-duplication, don't overthink and strictly follow the task instruction.
+
+**Example 4: Time related questions**
+- Strictly follow the task instruction on time related questions. If timezone is not specified, ALWAYS use GMT+0800 (China Standard Time) as the default timezone, not the machine's local timezone
+
+
+**Key Rule**: For file tasks, use length checks and exact path verification. Don't rely only on visual inspection.
+
+Now proceed with your verification work."""
+        
+        return prompt
+    
+    async def _verify_task_completion(
+        self,
+        instruction: str,
+        functions: List[Dict],
+        mcp_server: Any,
+        tool_call_log_file: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Run verification agent in its own MDP loop.
+        
+        Args:
+            instruction: Original task instruction
+            functions: Available tool functions (all tools, not filtered)
+            mcp_server: MCP server instance
+            tool_call_log_file: Log file path
+            
+        Returns:
+            {
+                "passed": bool,
+                "issues": str,  # Empty if passed, detailed issues if failed
+                "verification_report": str
+            }
+        """
+        tools = [{"type": "function", "function": func} for func in functions] if functions else []
+        
+        # Verification MDP State
+        verification_report = ""
+        last_actions = ""
+        
+        # Tracking
+        total_tokens = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "reasoning_tokens": 0}
+        turn_count = 0
+        max_verification_turns = 20  # Limit verification iterations
+        consecutive_failures = 0
+        max_consecutive_failures = 3
+        
+        def _record_usage(response_obj):
+            """Accumulate token usage from a LiteLLM response."""
+            if hasattr(response_obj, 'usage') and response_obj.usage:
+                input_tokens = response_obj.usage.prompt_tokens or 0
+                total_tokens_count = response_obj.usage.total_tokens or 0
+                output_tokens = (
+                    total_tokens_count - input_tokens
+                    if total_tokens_count > 0
+                    else (response_obj.usage.completion_tokens or 0)
+                )
+                total_tokens["input_tokens"] += input_tokens
+                total_tokens["output_tokens"] += output_tokens
+                total_tokens["total_tokens"] += total_tokens_count
+                if hasattr(response_obj.usage, 'completion_tokens_details'):
+                    details = response_obj.usage.completion_tokens_details
+                    if hasattr(details, 'reasoning_tokens'):
+                        total_tokens["reasoning_tokens"] += details.reasoning_tokens or 0
+        
+        if tool_call_log_file:
+            with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                f.write("\n===== VERIFICATION AGENT STARTED =====\n")
+        
+        logger.info("🔍 Starting verification agent MDP loop")
+        
+        try:
+            while turn_count < max_verification_turns:
+                # Build verification prompt
+                user_prompt = self._build_verification_mdp_prompt(
+                    task=instruction,
+                    tools=tools,
+                    verification_report=verification_report,
+                    last_actions=last_actions
+                )
+                
+                # Build messages
+                messages = [
+                    {"role": "user", "content": user_prompt}
+                ]
+                
+                # Build completion kwargs
+                completion_kwargs = {
+                    "model": self.litellm_input_model_name,
+                    "messages": messages,
+                    "api_key": self.api_key,
+                }
+                
+                if self.reasoning_effort != "default":
+                    completion_kwargs["reasoning_effort"] = self.reasoning_effort
+                if self.base_url:
+                    completion_kwargs["base_url"] = self.base_url
+                
+                try:
+                    # Call LLM
+                    if self._openai_client:
+                        response = await asyncio.wait_for(
+                            self._openai_client.acompletion(
+                                messages=messages,
+                                tools=None,
+                                tool_choice=None,
+                            ),
+                            timeout=self.timeout / 2
+                        )
+                    else:
+                        response = await asyncio.wait_for(
+                            litellm.acompletion(**completion_kwargs),
+                            timeout=self.timeout / 2
+                        )
+                    consecutive_failures = 0
+                except asyncio.TimeoutError:
+                    logger.warning(f"| ✗ Verification LLM call timed out on turn {turn_count + 1}")
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        break
+                    await asyncio.sleep(8 ** consecutive_failures)
+                    continue
+                except Exception as e:
+                    logger.error(f"| ✗ Verification LLM call failed on turn {turn_count + 1}: {e}")
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        break
+                    await asyncio.sleep(2 ** consecutive_failures)
+                    continue
+                
+                # Update token usage
+                _record_usage(response)
+                
+                # Get response content
+                choices = response.choices
+                if not len(choices):
+                    logger.error("| ✗ No choices in verification response")
+                    break
+                
+                message = choices[0].message
+                content = message.content if hasattr(message, 'content') else ""
+                
+                if not content:
+                    logger.error("| ✗ Empty content in verification response")
+                    break
+                
+                # Log the response
+                if tool_call_log_file:
+                    with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                        f.write(f"\n===== Verification Turn {turn_count + 1} Response =====\n")
+                        f.write(content + "\n")
+                
+                # Parse MDP response
+                parsed = self._parse_mdp_response(content)
+                
+                if parsed.get("error"):
+                    logger.error(f"| ✗ Failed to parse verification response: {parsed['error']}")
+                    logger.warning(f"| ⚠️  Parse error on verification turn {turn_count + 1}, will retry on next turn")
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        logger.error(f"| ✗ Too many consecutive parse failures ({consecutive_failures})")
+                        break
+                    # Retry by continuing to next iteration
+                    turn_count += 1
+                    continue
+                
+                # Reset failure counter on successful parse
+                consecutive_failures = 0
+                
+                # Update verification report
+                new_report = parsed["report"]
+                verification_report = new_report
+                logger.info(f"🔍 Verification report updated: {verification_report[:200]}{'...' if len(verification_report) > 200 else ''}")
+                
+                # Check if verification concluded
+                if parsed.get("answer"):
+                    answer = parsed["answer"].strip()
+                    logger.info(f"🔍 Verification concluded: {answer[:200]}{'...' if len(answer) > 200 else ''}")
+                    
+                    if tool_call_log_file:
+                        with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                            f.write(f"\n===== VERIFICATION CONCLUDED =====\n")
+                            f.write(f"Answer: {answer}\n")
+                    
+                    # Check if passed or failed
+                    if "Task Verification Passed" in answer or "VERIFICATION PASSED" in answer.upper():
+                        logger.info("✅ Verification PASSED")
+                        return {
+                            "passed": True,
+                            "issues": "",
+                            "verification_report": verification_report
+                        }
+                    else:
+                        logger.warning(f"❌ Verification FAILED")
+                        return {
+                            "passed": False,
+                            "issues": answer,
+                            "verification_report": verification_report
+                        }
+                
+                # Execute tool calls for more inspection
+                tool_calls_list = parsed.get("tool_calls", [])
+                if not tool_calls_list:
+                    logger.warning("| ⚠️ Verification agent provided no answer and no tool_calls")
+                    break
+                
+                logger.info(f"| 🔍 Verification executing {len(tool_calls_list)} tool call(s)")
+                
+                tool_results = []
+                actions_log = []
+                
+                for idx, tool_call_spec in enumerate(tool_calls_list):
+                    func_name = tool_call_spec.get("name")
+                    func_args = tool_call_spec.get("arguments", {})
+                    
+                    if not func_name:
+                        logger.error(f"| ✗ Verification tool call {idx} missing 'name'")
+                        continue
+                    
+                    # Log tool call
+                    args_str = json.dumps(func_args, separators=(",", ": "))
+                    display_args = args_str[:250] + "..." if len(args_str) > 250 else args_str
+                    logger.info(f"| 🔍 \033[1m{func_name}\033[0m \033[2;37m{display_args}\033[0m")
+                    
+                    if tool_call_log_file:
+                        with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                            f.write(f"| [VERIFICATION] {func_name} {args_str}\n")
+                    
+                    # Record action for next iteration
+                    actions_log.append(f"{func_name}({args_str})")
+                    
+                    # Execute tool
+                    try:
+                        result = await asyncio.wait_for(
+                            mcp_server.call_tool(func_name, func_args),
+                            timeout=60
+                        )
+                        formatted_result = self._format_tool_result_for_model(result, func_name)
+                        tool_results.append({
+                            "tool": func_name,
+                            "result": formatted_result
+                        })
+                        
+                        
+                    except asyncio.TimeoutError:
+                        error_msg = f"Tool call '{func_name}' timed out after 60 seconds"
+                        logger.error(f"| ✗ {error_msg}")
+                        tool_results.append({
+                            "tool": func_name,
+                            "result": f"Error: {error_msg}"
+                        })
+                    except Exception as e:
+                        logger.error(f"| ✗ Verification tool call '{func_name}' failed: {e}")
+                        tool_results.append({
+                            "tool": func_name,
+                            "result": f"Error: {str(e)}"
+                        })
+                
+                # Update state for next iteration - combine actions and results
+                combined_turn_data = []
+                for call, result in zip(tool_calls_list, tool_results):
+                    combined_turn_data.append({
+                        "tool": call.get("name"),
+                        "arguments": call.get("arguments", {}),
+                        "result": result.get("result", "")
+                    })
+                
+                # Convert to JSON format for prompt
+                last_actions = json.dumps(combined_turn_data, indent=2)
+                
+                turn_count += 1
+            
+        except Exception as verification_error:
+            logger.error(f"Verification loop failed: {verification_error}", exc_info=True)
+            return {
+                "passed": True,
+                "issues": f"Verification inconclusive due to error: {str(verification_error)}",
+                "verification_report": verification_report
+            }
+        
+        # Verification took too many turns or stopped - treat as inconclusive/pass
+        logger.warning(f"| ⚠️ Verification inconclusive after {turn_count} turns")
+        return {
+            "passed": True,
+            "issues": "Verification inconclusive (max turns reached)",
+            "verification_report": verification_report
+        }
+    
+    def _build_mdp_prompt(
+        self,
+        task: str,
+        tools: List[Dict],
+        report: str = "",
+        last_actions: str = "",
+        verification_issues: str = ""
+    ) -> str:
+        """Build the prompt for MDP-based agent following the specified format."""
+        
+        # Format tools description (similar to ReAct agent)
+        descriptions = []
+        for tool in tools:
+            func_info = tool.get("function", {})
+            name = func_info.get("name", "unknown")
+            description = func_info.get("description", "No description provided.")
+            parameters = func_info.get("parameters", {}) or {}
+            properties = parameters.get("properties", {}) or {}
+            required = set(parameters.get("required", []) or [])
+            
+            arg_lines = []
+            for prop_name, prop_details in properties.items():
+                details = json.dumps(prop_details, ensure_ascii=False, indent=2)
+                suffix = " (required)" if prop_name in required else ""
+                arg_lines.append(f"- {prop_name}{suffix}: {details}")
+            
+            if arg_lines:
+                arguments_text = "\n".join(arg_lines)
+            else:
+                arguments_text = "(no arguments)"
+            
+            descriptions.append(
+                f"Tool: {name}\nDescription: {description}\nArguments:\n{arguments_text}"
+            )
+        
+        tools_description = "\n\n".join(descriptions) if descriptions else "(no tools available)"
+        
+        prompt = f"""You are a professional problem-solving agent with rigorous information verification capabilities and deep analytical thinking.
+
+## CRITICAL OUTPUT FORMAT REQUIREMENTS
+
+You MUST follow this exact format. Every response must contain:
+
+1. <report>...</report> (always required)
+2. Either <answer>...</answer> OR <tool_calls>...</tool_calls> (never both)
+
+## Input Format
+
+- **Task**: The task posed by the user that needs to be solved
+- **Verification Issues**: Issues discovered by the verification agent (if any). Empty on first attempt. You need to solve the issue detected to complete task successfully.
+- **Last Status Report and Deep Analysis**: A summary overview of current work progress
+- **Last Turn Actions & Results**: Tools you called previously with their results (in `<tool_calls_and_results>` tag)
+
+## Output Format
+
+<report>
+
+### Status Report and Deep Analysis
+
+**Progress Achieved:**
+
+Based on the Last Status Report and Deep Analysis and Last Tool Response provided in the input, compile a comprehensive and complete documentation of all currently collected information, conclusions, data, and findings. This section must capture ALL important information without any omissions, presented in plain text format with corresponding sources clearly annotated. You must directly record the actual information content rather than using referential markers or summaries. This includes:
+
+1. All factual data and evidence collected
+2. All analytical conclusions and insights derived
+3. All source materials and their verification status
+4. All uncertainties, limitations, or gaps identified
+5. Complete integration of previous progress with new findings
+
+The documentation must be sufficiently detailed and complete that someone can fully inherit and understand all achieved progress to seamlessly continue the research without losing any critical information or context.
+
+**Next Steps Plan:**
+
+Based on the comprehensive progress achieved above, formulate a detailed and actionable plan for the next phase of research or investigation.
+
+</report>
+
+You MUST output this section enclosed with <report></report> tags!
+
+**Decision Point**: Are you centain that no further action tools needed to complete the task(e.g wrote the result to expected place)?
+
+**If YES - Task fully completed:**
+
+<answer>
+Provide the final answer or simply states "Task Completed"
+</answer>
+
+**If NO - Further action needed: return a list of tool call in tool calls**
+<tool_calls>
+"name": "tool name here", "arguments": "parameter name here": parameter value here,
+"another parameter name here": another parameter value here, ...,
+...
+</tool_calls>
+Tool calls must be in valid JSON format.
+Example:
+<tool_calls>
+[{{"name": "list_directory", "arguments": {{"path": "/some/path"}}}}, {{"name": "read_file", "arguments": {{"path": "/some/file.txt"}}}}]
+</tool_calls>
+
+You MUST output this section enclosed with <tool_calls></tool_calls> tags!
+
+## Working Principles
+
+1. **Rigorous Verification**: Critically evaluate all information sources
+2. **Deep Thinking**: Pursue essential understanding, not satisfied with surface phenomena
+3. **Evidence-Driven**: Make reasoning decisions based on reliable evidence through deep thinking
+4. **You are required to maintain detailed documentation in all your reports and actions, providing sufficient information for others to fully grasp your progress and effectively continue or modify the research trajectory based on your contributions.**
+
+## Special Requirements
+
+- All tools in the tool list are real and functional - as long as you make correct tool calls, you will receive their returned results.
+- Clearly distinguish between "confirmed facts," "highly credible inferences," and "hypotheses to be verified"
+- Clearly indicate uncertainty when information is insufficient
+- Always focus on the original task and follow the task instruction strictly. Do not generate new requirements by your own understanding.
+- When outputting [Status Report and Deep Analysis], never omit key actions and results, even if these actions or results do not meet expectations, these conclusions must still be documented.
+- **When further action is needed, select appropriate tools and configure parameters carefully. Explore the allowed workspace first before operating on any paths.**
+- **IMPORTANT: Directory names in task descriptions (e.g. "desktop", "test_folder") are context references, NOT instructions to create new directories. The allowed root IS your working directory - create required structures directly there, not inside a wrapper directory matching the task's reference name.**
+- **When the current status is sufficient to answer the question, must provide the final answer enclosed with <answer></answer> tags rather than continue with actions**
+- **If timezone is not specified in the task, use GMT+0800 (China Standard Time) as the default timezone, not the machine's local timezone.**
+
+## Core behavior rules
+- **Observe, don’t assume.**
+  - When a file or path is obviously relevant (metadata, labels, counts, CSV/TSV, summaries), you MUST open and inspect it instead of guessing from its name or context.
+
+- **Follow the task spec literally.**
+  - Use only the rules given in the instructions (and any explicit default like the timezone). Do not invent extra policies (e.g. custom tie-breakers, “representative” choices).
+
+- **Be exact when the task is exact.**
+  - For byte-level transforms, indices, or equality checks, operate on the real file content and ensure the result is exactly what the spec says (no off-by-one, no lossy aggregation).
+
+- **Match format and cover all required items.**
+  - Output must follow the task-specified schema and naming style (including human-readable names), and you must ensure all clearly relevant files / groups / events are handled, not just a subset.
+
+## Task Completion Verification
+
+**Important**: When you provide <answer> claiming task completion, your work will be automatically verified by a verification agent who will:
+- Inspect the actual environment state using tools
+- Check all requirements are met correctly and completely
+- Identify any issues, missing items, or incorrect implementations
+
+If the verification agent discover issues, they will be provided in "Verification Issues" and you must address them in a new run.
+
+Therefore:
+- **Be thorough** and complete all requirements before claiming completion
+- **Double-check your work** to ensure correctness in the solving process
+
+## FORMAT REMINDER
+
+- Start with <report>...</report> section
+- Then choose: <answer>...</answer> if sufficient info, OR <tool_calls>...</tool_calls> if need more action
+- Never output both answer and tool_calls tags in same response
+
+## Input
+
+- Task: {task}
+
+- Verification Issues: 
+{verification_issues if verification_issues else "(No issues - first attempt or previous verification passed)"}
+
+- Available Tools
+{tools_description}
+
+- Last Status Report and Deep Analysis:
+<report>
+{report}
+</report>
+
+- Last Turn Actions & Results:
+
+⚠️ Check if you already have the information below before calling the same tools again!
+
+<tool_calls_and_results>
+{last_actions}
+</tool_calls_and_results>
+
+Now please begin your deep analytical work."""
+        
+        return prompt
+    
+    def _parse_mdp_response(self, content: str) -> Dict[str, Any]:
+        """Parse the MDP response with <report>, <answer>, and <tool_calls> tags."""
+        import re
+        
+        result = {
+            "report": "",
+            "answer": None,
+            "tool_calls": None,
+            "error": None
+        }
+        
+        # Extract report (required)
+        report_match = re.search(r'<report>(.*?)</report>', content, re.DOTALL | re.IGNORECASE)
+        if report_match:
+            result["report"] = report_match.group(1).strip()
+        else:
+            result["error"] = "No <report> section found in response"
+            return result
+        
+        # Extract answer (optional)
+        answer_match = re.search(r'<answer>(.*?)</answer>', content, re.DOTALL | re.IGNORECASE)
+        if answer_match:
+            result["answer"] = answer_match.group(1).strip()
+            return result  # If answer exists, don't look for tool_calls
+        
+        # Extract tool_calls (optional)
+        tool_calls_match = re.search(r'<tool_calls>(.*?)</tool_calls>', content, re.DOTALL | re.IGNORECASE)
+        if not tool_calls_match:
+            # Fallback: try to extract without closing tag (LLM sometimes forgets it)
+            tool_calls_match = re.search(r'<tool_calls>\s*(\[.*)', content, re.DOTALL | re.IGNORECASE)
+        
+        if tool_calls_match:
+            tool_calls_str = tool_calls_match.group(1).strip()
+            
+            # Fix common model error: }]}] at end should be }}]
+            if tool_calls_str.endswith('}]}]'):
+                tool_calls_str = tool_calls_str[:-3] + '}]'
+            
+            # Fix common model error: missing closing } before ]
+            if tool_calls_str.endswith('{}]') and not tool_calls_str.endswith('}}]'):
+                open_count = tool_calls_str.count('{')
+                close_count = tool_calls_str.count('}')
+                if open_count > close_count:
+                    missing = open_count - close_count
+                    tool_calls_str = tool_calls_str[:-1] + '}' * missing + ']'
+            
+            try:
+                tool_calls_list = json.loads(tool_calls_str)
+                if isinstance(tool_calls_list, list):
+                    result["tool_calls"] = tool_calls_list
+                else:
+                    result["error"] = "tool_calls must be a JSON array"
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse tool_calls JSON: {e}, raw string: {tool_calls_str}")
+                result["error"] = (
+                    f"Failed to parse tool_calls JSON: {e}\n"
+                    f"Attempted to parse: {tool_calls_str[:500]}\n"
+                    f"Error at position {e.pos}: ...{tool_calls_str[max(0, e.pos-30):e.pos+30]}..."
+                )
+                return result
+        
+        # Must have either answer or tool_calls
+        if result["answer"] is None and result["tool_calls"] is None:
+            result["error"] = "Response must contain either <answer> or <tool_calls>"
+        
+        return result
+    
+    async def _compress_mdp_observations_if_needed(
+        self,
+        tool_results: List[Dict[str, str]],
+        tool_calls_list: List[Dict],
+        current_report: str,
+        instruction: str,
+        turn_count: int,
+        tool_call_log_file: Optional[str] = None
+    ) -> List[Dict[str, str]]:
+        """
+        Compress MDP observations if they exceed 80% of remaining budget.
+        
+        MDP-specific compression strategy:
+        - Only maintains last turn's data (not full history)
+        - Higher threshold (80% of remaining budget) compared to other agents
+        - Compresses individual tool results if needed
+        
+        Args:
+            tool_results: List of tool results from this turn
+            tool_calls_list: List of tool calls from this turn
+            current_report: Current MDP report
+            instruction: Original task instruction
+            turn_count: Current turn number
+            tool_call_log_file: Optional log file path
+            
+        Returns:
+            Potentially compressed tool results (as objects, not JSON string)
+        """
+        # Estimate tokens in observations
+        last_observations_raw = json.dumps(tool_results, indent=2)
+        observations_tokens = self._estimate_tokens(last_observations_raw)
+        
+        # Get model context limit and calculate remaining budget
+        context_limit = self._get_model_context_limit()
+        
+        # Estimate current state tokens (task + report + actions)
+        task_tokens = self._estimate_tokens(instruction)
+        report_tokens = self._estimate_tokens(current_report)
+        actions_json = json.dumps(tool_calls_list, indent=2)
+        actions_tokens = self._estimate_tokens(actions_json)
+        
+        # Calculate remaining budget
+        current_state_tokens = task_tokens + report_tokens + actions_tokens
+        remaining_budget = context_limit - current_state_tokens
+        
+        # MDP threshold: 80% of remaining budget
+        mdp_threshold = 0.8
+        threshold_tokens = remaining_budget * mdp_threshold
+        
+        logger.info(
+            f"| 📊 MDP Token Check (Turn {turn_count}): "
+            f"observations={observations_tokens}, "
+            f"remaining={remaining_budget}, "
+            f"threshold={int(threshold_tokens)} ({mdp_threshold:.0%})"
+        )
+        
+        # Check if compression is needed
+        if observations_tokens <= threshold_tokens:
+            return tool_results  # No compression needed, return original objects
+        
+        logger.warning(
+            f"| ⚠️  MDP Compression triggered: "
+            f"observations={observations_tokens} > threshold={int(threshold_tokens)}"
+        )
+        
+        if tool_call_log_file:
+            with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                f.write(
+                    f"\n[MDP COMPRESSION START] Turn {turn_count}: "
+                    f"{observations_tokens} tokens > {int(threshold_tokens)} threshold\n"
+                )
+        
+        # Build tool contexts for compression (similar to other agents)
+        tool_contexts = []
+        for tool_result, tool_call_spec in zip(tool_results, tool_calls_list):
+            tool_name = tool_result.get("tool", "unknown")
+            result_text = tool_result.get("result", "")
+            
+            tool_contexts.append({
+                "name": tool_name,  # Match field name expected by _compress_single_tool_result
+                "arguments": json.dumps(tool_call_spec.get("arguments", {})),
+                "formatted_result": result_text,
+                "result_tokens": self._estimate_tokens(result_text)
+            })
+        
+        # Compress all tool results since we've already determined compression is needed
+        logger.info(f"| 🔄 Compressing all {len(tool_contexts)} MDP result(s)...")
+        
+        compression_tasks = [
+            self._compress_single_tool_result(
+                ctx, instruction, current_report, tool_call_log_file
+            )
+            for ctx in tool_contexts
+        ]
+        
+        # Execute compression in parallel
+        try:
+            compressed_results = await asyncio.wait_for(
+                asyncio.gather(*compression_tasks, return_exceptions=True),
+                timeout=900  # 5 minutes max
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"| ✗ MDP compression timeout. Using original.")
+            return tool_results  # Timeout, return original objects
+        
+        # Build final compressed observations
+        final_tool_results = []
+        
+        for i, (tool_result, compressed_result) in enumerate(zip(tool_results, compressed_results)):
+            if isinstance(compressed_result, Exception):
+                logger.error(f"| ✗ MDP compression failed for result {i}. Using original.")
+                final_tool_results.append(tool_result)
+            else:
+                # Use compressed result
+                compressed_text = compressed_result.get("formatted_result", tool_result.get("result", ""))
+                final_tool_results.append({
+                    "tool": tool_result.get("tool"),
+                    "result": compressed_text
+                })
+        
+        # Estimate tokens for logging (but return objects, not JSON string)
+        compressed_observations_json = json.dumps(final_tool_results, indent=2)
+        compressed_tokens = self._estimate_tokens(compressed_observations_json)
+        compression_ratio = compressed_tokens / observations_tokens if observations_tokens > 0 else 1.0
+        
+        logger.info(
+            f"| 🗜️  MDP compression complete: "
+            f"{observations_tokens} → {compressed_tokens} tokens ({compression_ratio:.1%})"
+        )
+        
+        if tool_call_log_file:
+            with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                f.write(
+                    f"[MDP COMPRESSION END] Turn {turn_count}: "
+                    f"{observations_tokens} → {compressed_tokens} tokens ({compression_ratio:.1%})\n"
+                )
+        
+        return final_tool_results  # Return as list of objects
+    
+    # ==================== Multi-Agent Orchestration (Planner / Explorer / Worker / Verifier) ====================
+    
+    def _parse_json_object(self, payload: str) -> Dict[str, Any]:
+        """
+        Best-effort JSON object parser used by multi-agent helpers.
+        
+        Strips code fences / leading 'json' labels and, if needed, extracts the
+        outermost {...} block.
+        """
+        candidate = (payload or "").strip()
+        candidate = candidate.strip("`").strip()
+        if candidate.lower().startswith("json"):
+            candidate = candidate[4:].lstrip()
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            # Try to extract first JSON object block
+            start = candidate.find("{")
+            end = candidate.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                try:
+                    return json.loads(candidate[start : end + 1])
+                except json.JSONDecodeError:
+                    pass
+        raise ValueError("Failed to parse JSON object from model response")
+    
+    def _accumulate_usage_from_response(self, total_tokens: Dict[str, int], response_obj: Any) -> None:
+        """
+        Helper to accumulate token usage from a LiteLLM / OpenAI-style response object.
+        """
+        if not hasattr(response_obj, "usage") or not response_obj.usage:
+            return
+        usage = response_obj.usage
+        prompt_tokens = getattr(usage, "prompt_tokens", None) or getattr(usage, "input_tokens", None) or 0
+        completion_tokens = (
+            getattr(usage, "completion_tokens", None)
+            or getattr(usage, "output_tokens", None)
+            or 0
+        )
+        total_tokens_count = getattr(usage, "total_tokens", None)
+        if total_tokens_count is None:
+            total_tokens_count = prompt_tokens + completion_tokens
+        total_tokens["input_tokens"] += prompt_tokens
+        total_tokens["output_tokens"] += completion_tokens
+        total_tokens["total_tokens"] += total_tokens_count
+        if hasattr(usage, "completion_tokens_details"):
+            details = usage.completion_tokens_details
+            if hasattr(details, "reasoning_tokens"):
+                total_tokens["reasoning_tokens"] += details.reasoning_tokens or 0
+    
+    def _render_tools_description_for_multi_agent(self, functions: List[Dict[str, Any]]) -> str:
+        """
+        Render tool / function descriptions in a human-readable form for prompts.
+        Reuses logic similar to ReAct / MDP formatting.
+        """
+        if not functions:
+            return "(no tools available)"
+        descriptions: List[str] = []
+        for func in functions:
+            name = func.get("name", "unknown")
+            description = func.get("description", "No description provided.")
+            parameters = func.get("parameters", {}) or {}
+            properties = parameters.get("properties", {}) or {}
+            required = set(parameters.get("required", []) or [])
+            arg_lines: List[str] = []
+            for prop_name, prop_details in properties.items():
+                details = json.dumps(prop_details, ensure_ascii=False, indent=2)
+                suffix = " (required)" if prop_name in required else ""
+                arg_lines.append(f"- {prop_name}{suffix}: {details}")
+            arguments_text = "\n".join(arg_lines) if arg_lines else "(no arguments)"
+            descriptions.append(
+                f"Tool: {name}\nDescription: {description}\nArguments:\n{arguments_text}"
+            )
+        return "\n\n".join(descriptions)
+    
+    async def _run_explorer_agent(
+        self,
+        task_description: str,
+        current_plan: Optional[Dict[str, Any]],
+        functions: List[Dict[str, Any]],
+        mcp_server: Any,
+        total_tokens: Dict[str, int],
+        tool_call_log_file: Optional[str],
+    ) -> Dict[str, Any]:
+        system_prompt = """
+You are the Explorer. You inspect the environment using READ-ONLY tools and produce a concise environment summary.
+
+IMPORTANT: 
+- The allowed/accessible directory is your working root. Directory names in task descriptions (like "test directory") are naming context only - the accessible root already represents that location. Do not suggest creating wrapper directories with such names unless explicitly requested by the user.
+- Do NOT write, edit, create, move, or delete any files - you are read-only.
+
+Your goals:
+- Discover what seems relevant to the user's task.
+- Be thorough in coverage. When you discover something relevant in a complex envrionment (e.g many nested directories file system), follow up and inspect deeper. For example, if you are uncertain about if a directory/file is related to the task or not, always inspect it, e.g read files or list directorys. Don't miss any possible related resources.
+- When inspecting files to get preview information, prefer reading first few lines rather than entire contents unless needed.
+- Summarize structure and key resources in summary_text.
+- For each important resource, create a resources[] entry with:
+  - id: a short local id like "R1", "R2".
+  - locator: how tools will refer to it (e.g., path, URL, id).
+  - kind: "directory", "file", "api", "table", etc.
+  - format: "text", "json", "csv", "binary", etc.
+  - preview: a short description or small content sample.
+  - notes: how and when this resource might be useful.
+
+
+Interaction:
+- Call tools to inspect the environment. Batch multiple independent similar tool calls in a single turn when possible.
+- When done, respond with a single EnvironmentSummary JSON object (no code fences):
+  {"summary_text": "...", "resources": [...]}
+"""
+        explorer_input = {
+            "task_description": task_description,
+            "current_plan": current_plan,
+        }
+        user_content = f"""ExplorerInput JSON:
+{json.dumps(explorer_input, ensure_ascii=False, indent=2)}
+"""
+        
+        # Prepare messages and tools for function calling
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+        tools = [{"type": "function", "function": func} for func in functions] if functions else None
+        max_turns = min(self.MAX_TURNS, 50)  # keep Explorer bounded
+        turn_count = 0
+        consecutive_failures = 0
+        max_consecutive_failures = 3
+        
+        # Optional logging of available tools
+        if tool_call_log_file and tools:
+            max_name_length = max(
+                len(tool.get("function", {}).get("name", "")) for tool in tools
+            )
+            with open(tool_call_log_file, "a", encoding="utf-8") as f:
+                f.write(f"\n===== Explorer Logs (max_turns: {max_turns}) =====\n")
+        
+        while turn_count < max_turns:
+            turn_count += 1
+            # Log turn count
+            logger.info(f"| [Explorer] Turn {turn_count}/{max_turns}")
+            if tool_call_log_file:
+                with open(tool_call_log_file, "a", encoding="utf-8") as f:
+                    f.write(f"[Explorer] Turn {turn_count}/{max_turns}\n")
+            
+            completion_kwargs: Dict[str, Any] = {
+                "model": self.litellm_input_model_name,
+                "messages": messages,
+                "api_key": self.api_key,
+            }
+            if tools:
+                completion_kwargs["tools"] = tools
+                completion_kwargs["tool_choice"] = "auto"
+            if self.reasoning_effort != "default":
+                completion_kwargs["reasoning_effort"] = self.reasoning_effort
+            if self.base_url:
+                completion_kwargs["base_url"] = self.base_url
+            
+            try:
+                response = await asyncio.wait_for(
+                    litellm.acompletion(**completion_kwargs),
+                    timeout=self.timeout / 2,
+                )
+                consecutive_failures = 0
+            except asyncio.TimeoutError:
+                logger.warning("| [Explorer] LLM call timed out")
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    raise
+                await asyncio.sleep(2 ** consecutive_failures)
+                continue
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"| [Explorer] LLM call failed: {exc}")
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    raise
+                await asyncio.sleep(2 ** consecutive_failures)
+                continue
+            
+            # Track model name and usage
+            if not self.litellm_run_model_name and getattr(response, "model", None):
+                self.litellm_run_model_name = response.model.split("/")[-1]
+            self._accumulate_usage_from_response(total_tokens, response)
+            
+            choices = response.choices
+            if not choices:
+                logger.warning("| [Explorer] Empty choices from LLM")
+                break
+            message = choices[0].message
+            message_dict = message.model_dump() if hasattr(message, "model_dump") else dict(message)
+            
+            # Log assistant text (if any)
+            if hasattr(message, "content") and message.content:
+                for line in str(message.content).splitlines():
+                    logger.info(f"| [Explorer] {line}")
+                if tool_call_log_file:
+                    with open(tool_call_log_file, "a", encoding="utf-8") as f:
+                        f.write(f"[Explorer Assistant]\n{message.content}\n")
+            
+            # If there are tool_calls, execute them and continue
+            if hasattr(message, "tool_calls") and message.tool_calls:
+                messages.append(message_dict)
+                for tool_call in message.tool_calls:
+                    func_name = tool_call.function.name
+                    try:
+                        func_args = json.loads(tool_call.function.arguments or "{}")
+                    except json.JSONDecodeError:
+                        func_args = {}
+                    args_str = json.dumps(func_args, separators=(",", ": "))
+                    display_args = args_str[:140] + "..." if len(args_str) > 140 else args_str
+                    logger.info(f"| [Explorer] Tool {func_name} {display_args}")
+                    if tool_call_log_file:
+                        with open(tool_call_log_file, "a", encoding="utf-8") as f:
+                            f.write(f"[Explorer ToolCall] {func_name} {args_str}\n")
+                    try:
+                        result = await asyncio.wait_for(
+                            mcp_server.call_tool(func_name, func_args),
+                            timeout=60,
+                        )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": json.dumps(result, ensure_ascii=False),
+                            }
+                        )
+                    except asyncio.TimeoutError:
+                        error_msg = f"Tool '{func_name}' timed out after 60 seconds"
+                        logger.error(f"| [Explorer] {error_msg}")
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": f"Error: {error_msg}",
+                            }
+                        )
+                    except Exception as tool_exc:  # noqa: BLE001
+                        error_msg = f"Tool '{func_name}' failed: {tool_exc}"
+                        logger.error(f"| [Explorer] {error_msg}")
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": f"Error: {error_msg}",
+                            }
+                        )
+                continue
+            
+            # No tool calls: treat as final EnvironmentSummary JSON
+            messages.append(message_dict)
+            content_text = getattr(message, "content", "")
+            try:
+                env_summary = self._parse_json_object(str(content_text))
+            except ValueError:
+                # Ask model to reformat as proper JSON
+                logger.warning("| [Explorer] Final response was not valid JSON, requesting correction")
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your previous reply was not valid JSON for EnvironmentSummary. "
+                            "Please respond again with ONLY the EnvironmentSummary JSON object, "
+                            "without code fences or extra text."
+                        ),
+                    }
+                )
+                continue
+            
+            # Basic sanity check of EnvironmentSummary structure
+            if "summary_text" not in env_summary or "resources" not in env_summary:
+                logger.warning("| [Explorer] EnvironmentSummary missing required keys; requesting correction")
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "The EnvironmentSummary must include both `summary_text` and `resources`. "
+                            "Please resend ONLY a valid EnvironmentSummary JSON object."
+                        ),
+                    }
+                )
+                continue
+            
+            return env_summary
+        
+        raise RuntimeError("Explorer agent failed to produce a valid EnvironmentSummary within turn limit")
+    
+    async def _run_worker_agent(
+        self,
+        task_description: str,
+        environment_summary: Dict[str, Any],
+        current_subtask: Dict[str, Any],
+        execution_state: Dict[str, Any],
+        functions: List[Dict[str, Any]],
+        mcp_server: Any,
+        total_tokens: Dict[str, int],
+        tool_call_log_file: Optional[str],
+    ) -> Dict[str, Any]:
+        system_prompt = """
+You are the Worker. You execute a single subtask at a time inside a larger task.
+
+You receive:
+- task_description: the original user task in natural language.
+- environment_summary: discovered resources and their structure.
+- current_subtask: the specific subtask you must work on now.
+- execution_state: the current plan, progress, artifacts, and logs.
+
+Rules:
+- Focus only on current_subtask; do not jump ahead to other subtasks.
+- Use the available tools to gather information and modify resources as needed.
+- Respect the user's constraints and the existing execution_state.
+- Keep tool usage efficient: avoid redundant calls; prefer lightweight inspection such as listing directories or reading only the first N lines when full content is not needed.
+- Be mindful of context limits: when processing many items, read only the necessary portions (e.g., first N lines via head parameter) rather than full content. Do NOT use read_multiple_files when only metadata or headers are needed.
+- When you have read file content, you can extract any portion of it and write it to files. You do NOT need special "slicing" or "range read" tools - simply identify the exact text you need from what you read and use write_file.
+
+Interaction:
+- On each turn you may either:
+  * Call tools (via tool_calls) to make progress on current_subtask, OR
+  * If you have enough information and work is finished or blocked, stop calling tools
+    and respond with a single JSON object describing the outcome of this subtask.
+
+Final JSON formats (no tool_calls in that same turn):
+- If the subtask is successfully completed:
+  {
+    "status": "subtask_completed",
+    "subtask_id": "<id from current_subtask>",
+    "summary": "<short description of what you did and where the result is>",
+    "artifacts": {
+      "<key>": "<value, e.g. file paths or IDs>"
+    }
+  }
+
+- If you are blocked and cannot proceed:
+  {
+    "status": "subtask_blocked",
+    "subtask_id": "<id from current_subtask>",
+    "reason": "<concrete reason you cannot continue and what is missing>"
+  }
+"""
+        worker_input = {
+            "task_description": task_description,
+            "environment_summary": environment_summary,
+            "current_subtask": current_subtask,
+            "execution_state": execution_state,
+        }
+        worker_input_json = json.dumps(worker_input, ensure_ascii=False, indent=2)
+        user_content = f"""WorkerInput JSON:
+{worker_input_json}
+"""
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+        tools = [{"type": "function", "function": func} for func in functions] if functions else None
+        max_turns = min(self.MAX_TURNS, 40)
+        turn_count = 0
+        consecutive_failures = 0
+        max_consecutive_failures = 3
+
+        if tool_call_log_file and tools:
+            max_name_length = max(
+                len(tool.get("function", {}).get("name", "")) for tool in tools
+            )
+            subtask_id = current_subtask.get("id", "unknown")
+            with open(tool_call_log_file, "a", encoding="utf-8") as f:
+                f.write(f"\n===== Worker Logs [{subtask_id}] (max_turns: {max_turns}) =====\n")
+
+        while turn_count < max_turns:
+            turn_count += 1
+            # Log turn count
+            subtask_id = current_subtask.get("id", "unknown")
+            logger.info(f"| [Worker] [{subtask_id}] Turn {turn_count}/{max_turns}")
+            if tool_call_log_file:
+                with open(tool_call_log_file, "a", encoding="utf-8") as f:
+                    f.write(f"[Worker] [{subtask_id}] Turn {turn_count}/{max_turns}\n")
+            
+            completion_kwargs: Dict[str, Any] = {
+                "model": self.litellm_input_model_name,
+                "messages": messages,
+                "api_key": self.api_key,
+            }
+            if tools:
+                completion_kwargs["tools"] = tools
+                completion_kwargs["tool_choice"] = "auto"
+            if self.base_url:
+                completion_kwargs["base_url"] = self.base_url
+            if self.reasoning_effort != "default":
+                completion_kwargs["reasoning_effort"] = self.reasoning_effort
+
+            try:
+                response = await asyncio.wait_for(
+                    litellm.acompletion(**completion_kwargs),
+                    timeout=self.timeout / 2,
+                )
+                consecutive_failures = 0
+            except asyncio.TimeoutError:
+                logger.warning("| [Worker] LLM call timed out")
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    raise
+                await asyncio.sleep(2 ** consecutive_failures)
+                continue
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"| [Worker] LLM call failed: {exc}")
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    raise
+                await asyncio.sleep(2 ** consecutive_failures)
+                continue
+
+            if not self.litellm_run_model_name and getattr(response, "model", None):
+                self.litellm_run_model_name = response.model.split("/")[-1]
+            self._accumulate_usage_from_response(total_tokens, response)
+
+            choices = response.choices
+            if not choices:
+                logger.warning("| [Worker] Empty choices from LLM")
+                break
+            message = choices[0].message
+            message_dict = message.model_dump() if hasattr(message, "model_dump") else dict(message)
+
+            # Log assistant text (if any)
+            if hasattr(message, "content") and message.content:
+                for line in str(message.content).splitlines():
+                    logger.info(f"| [Worker] {line}")
+                if tool_call_log_file:
+                    with open(tool_call_log_file, "a", encoding="utf-8") as f:
+                        f.write(f"[Worker Assistant]\n{message.content}\n")
+
+            # Handle tool calls for this subtask
+            if hasattr(message, "tool_calls") and message.tool_calls:
+                messages.append(message_dict)
+                for tool_call in message.tool_calls:
+                    func_name = tool_call.function.name
+                    try:
+                        func_args = json.loads(tool_call.function.arguments or "{}")
+                    except json.JSONDecodeError:
+                        func_args = {}
+                    args_str = json.dumps(func_args, separators=(",", ": "))
+                    display_args = args_str[:160] + "..." if len(args_str) > 160 else args_str
+                    logger.info(f"| [Worker] Tool {func_name} {display_args}")
+                    if tool_call_log_file:
+                        with open(tool_call_log_file, "a", encoding="utf-8") as f:
+                            f.write(f"[Worker ToolCall] {func_name} {args_str}\n")
+                    try:
+                        result = await asyncio.wait_for(
+                            mcp_server.call_tool(func_name, func_args),
+                            timeout=60,
+                        )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": json.dumps(result, ensure_ascii=False),
+                            }
+                        )
+                    except asyncio.TimeoutError:
+                        error_msg = f"Tool '{func_name}' timed out after 60 seconds"
+                        logger.error(f"| [Worker] {error_msg}")
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": f"Error: {error_msg}",
+                            }
+                        )
+                    except Exception as tool_exc:  # noqa: BLE001
+                        error_msg = f"Tool '{func_name}' failed: {tool_exc}"
+                        logger.error(f"| [Worker] {error_msg}")
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": f"Error: {error_msg}",
+                            }
+                        )
+                continue
+
+            # No tool calls: treat as final WorkerOutput JSON
+            messages.append(message_dict)
+            content_text = getattr(message, "content", "")
+            try:
+                worker_output = self._parse_json_object(str(content_text))
+            except ValueError:
+                logger.warning("| [Worker] Final response was not valid JSON, requesting correction")
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your previous reply was not valid JSON for the WorkerOutput. "
+                            "Please respond again with ONLY the WorkerOutput JSON object "
+                            "in one of the allowed formats (subtask_completed or subtask_blocked)."
+                        ),
+                    }
+                )
+                continue
+
+            status = worker_output.get("status")
+            if status not in ("subtask_completed", "subtask_blocked"):
+                logger.warning("| [Worker] WorkerOutput missing or invalid status; requesting correction")
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "The WorkerOutput must include a 'status' field equal to either "
+                            "'subtask_completed' or 'subtask_blocked'. Please resend ONLY a valid "
+                            "WorkerOutput JSON object."
+                        ),
+                    }
+                )
+                continue
+
+            # Basic field validation; orchestrator will do deeper state updates
+            return worker_output
+
+        raise RuntimeError(
+            f"Worker agent failed to produce a valid WorkerOutput for subtask {current_subtask.get('id')} within turn limit"
+        )
+    
+    async def _run_planning_agent(
+        self,
+        task_description: str,
+        current_plan: Optional[Dict[str, Any]],
+        environment_summary: Optional[Dict[str, Any]],
+        execution_state: Optional[Dict[str, Any]],
+        reason: str,
+        available_tools: List[str],
+        total_tokens: Dict[str, int],
+        tool_call_log_file: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        system_prompt = """
+You are the PlanningAgent for a multi-step tool-using agent system.
+Your job is to produce or update a structured, ordered plan of subtasks that a
+Worker can execute with tools.
+
+Inputs (PlanningInput JSON):
+- task_description: original user task in natural language.
+- environment_summary: discovered resources and their structure.
+- available_tools: list of tool names the worker can use.
+- current_plan: existing Plan (null if first planning).
+- execution_state: progress and artifacts from completed subtasks (null if none).
+- reason: short string explaining why re-planning is being called. could be null for first planning.
+
+Output:
+- a plan with an ordered list of subtasks that cover the whole task logically.
+- a high-level explanation of plan design choices.
+
+General rules:
+- Follow user instructions strictly; do not infer or add steps beyond what the task requires.
+- Never change the user's goal or instructions on your own knowledge for normal case.
+- Plan within the scope of environment_summary and available tools.
+- Use clear, self-contained subtasks in an ordered list. The order is the execution order for the worker.
+- Plans should be coarse but executable: each subtask should be doable by a Worker using the available_tools provided in the input.
+- Assign a unique, stable id to each subtask (e.g., "S1", "S2", ...).
+- If current_plan exists with completed subtasks, preserve them and their order.
+- If reason indicates a block, focus on unblocking by inserting new subtasks or redirecting work to existing resources mentioned in environment_summary and available tools. 
+- Always output valid JSON matching the schema below.
+
+Workload balancing:
+- Workers have limited context windows. When the task involves iterating over many items, divide the work into smaller subtasks (e.g., 15-18 items per tasks) to avoid context length issues.
+- When only partial content is needed (e.g., extracting metadata from headers), instruct the worker to read only the first N lines of each item. Do NOT recommend read_multiple_files for such tasks—it reads full file contents and will exceed context limits.
+- Use intermediate artifacts (e.g., save partial results to a file) to pass information between batches, then merge results in a final subtask.
+
+Output JSON schema:
+{
+  "plan": {
+    "subtasks": [
+      {
+        "id": "S1",                  // unique stable identifier for tracking
+        "description": "...",        // what the Worker should accomplish
+        "notes": "..."               // hints, resources (e.g., "use R1"), constraints
+      }
+    ]
+  },
+  "notes": "..."                     // high-level explanation of plan design choices
+}
+"""
+        planning_input = {
+            "task_description": task_description,
+            "environment_summary": environment_summary,
+            "available_tools": available_tools,
+            "current_plan": current_plan,
+            "execution_state": execution_state,
+            "reason": reason,
+        }
+        user_content = f"""PlanningInput JSON:
+{json.dumps(planning_input, ensure_ascii=False, indent=2)}
+"""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+        completion_kwargs: Dict[str, Any] = {
+            "model": self.litellm_input_model_name,
+            "messages": messages,
+            "api_key": self.api_key,
+        }
+        if self.base_url:
+            completion_kwargs["base_url"] = self.base_url
+        if self.reasoning_effort != "default":
+            completion_kwargs["reasoning_effort"] = self.reasoning_effort
+        
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            response = await asyncio.wait_for(
+                litellm.acompletion(**completion_kwargs),
+                timeout=self.timeout / 2,
+            )
+            if not self.litellm_run_model_name and getattr(response, "model", None):
+                self.litellm_run_model_name = response.model.split("/")[-1]
+            self._accumulate_usage_from_response(total_tokens, response)
+            choice = response.choices[0]
+            message_obj = getattr(choice, "message", None) or (choice.get("message") if isinstance(choice, dict) else None)
+            content_raw = getattr(message_obj, "content", None) if message_obj is not None else None
+            if content_raw is None and isinstance(choice, dict):
+                content_raw = choice.get("message", {}).get("content")
+            content_str = content_raw if isinstance(content_raw, str) else json.dumps(content_raw, ensure_ascii=False)
+            
+            try:
+                planning_output = self._parse_json_object(content_str)
+                break  # Success, exit loop
+            except ValueError:
+                if attempt < max_retries:
+                    messages.append({"role": "assistant", "content": content_str})
+                    messages.append({"role": "user", "content": "Invalid JSON. Reply with ONLY valid JSON."})
+                    completion_kwargs["messages"] = messages
+                    continue
+                raise  # Max retries reached
+        
+        # Log planning output to file
+        if tool_call_log_file:
+            try:
+                with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                    f.write(f"\n===== PlanningAgent ({reason}) =====\n")
+                    f.write(f"Output:\n{json.dumps(planning_output, ensure_ascii=False, indent=2)}\n")
+            except Exception:
+                pass
+        
+        return planning_output
+    
+    async def _run_verifier_agent(
+        self,
+        task_description: str,
+        environment_summary: Dict[str, Any],
+        functions: List[Dict[str, Any]],
+        mcp_server: Any,
+        total_tokens: Dict[str, int],
+        tool_call_log_file: Optional[str],
+    ) -> Dict[str, Any]:
+        """
+        Run the Verifier agent in a read-only fashion.
+        The Verifier independently inspects the environment to verify task completion,
+        without knowing what the Worker claimed to do.
+        """
+        system_prompt = """
+You are the Verifier. You independently verify whether the user's task has been correctly completed by inspecting the actual environment state.
+
+You have:
+- task_description: the original user task in natural language.
+- environment_summary: resource locations only (paths, kinds, formats) - use this to find where to inspect.
+
+IMPORTANT:
+- Derive expected outcomes from task_description only.
+- You can ONLY inspect and read. You MUST NOT modify anything.
+
+Verification Strategy:
+1. First, check the allowed workspace (list_allowed_directories) to understand the root
+2. Read the task_description carefully and identify what outputs/results are required
+3. Inspect actual outputs using tools - verify with actual inspection, not assumptions
+4. Compare: Does actual output match the task requirements? (completeness, correctness, format)
+5. Check for issues: missing items, incorrect data, wrong formats, unwanted extras
+6. Batch multiple independent tool calls in a single turn when possible
+
+Common Verification Pitfalls - CHECK CAREFULLY:
+- Wrong Directory Structure: Task mentions directory name as context (e.g., "in test directory") - this is NOT an instruction to create that directory. Check if an unnecessary wrapper directory was created.
+- Missing Requirements: Verify ALL requirements from the task are satisfied, not just some.
+- Format Issues: For tasks with specific formats, verify exact compliance.
+
+Guidelines:
+- Be systematic: Check each requirement methodically
+- Be thorough: Inspect actual files/outputs, don't trust claims without evidence
+- Be fair: Don't fail for trivial or subjective issues
+- Be specific: Issues must include evidence and be actionable
+
+Output Format - Once you have enough evidence, respond with a single JSON object:
+  {"status": "verified_ok", "summary": "...", "issues": []}
+  {"status": "verified_with_issues", "summary": "...", "issues": ["issue1 with evidence", "issue2 with evidence"]}
+"""
+        # Filter environment_summary to remove interpretation bias
+        # Keep only factual location data, remove summary_text and notes
+        filtered_env_summary = {}
+        if environment_summary:
+            # Keep only resource locations, strip interpretive fields
+            if "resources" in environment_summary:
+                filtered_resources = []
+                for res in environment_summary.get("resources", []):
+                    filtered_res = {
+                        "id": res.get("id"),
+                        "locator": res.get("locator"),
+                        "kind": res.get("kind"),
+                        "format": res.get("format"),
+                        "preview": res.get("preview"),
+                        # Intentionally omit "notes" - may contain interpretation bias
+                    }
+                    filtered_resources.append(filtered_res)
+                filtered_env_summary["resources"] = filtered_resources
+            # Intentionally omit "summary_text" - may contain interpretation bias
+        
+        verifier_input = {
+            "task_description": task_description,
+            "environment_summary": filtered_env_summary,
+        }
+        user_content = f"""VerifierInput JSON:
+{json.dumps(verifier_input, ensure_ascii=False, indent=2)}
+"""
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+        tools = [{"type": "function", "function": func} for func in functions] if functions else None
+        max_turns = min(self.MAX_TURNS, 30)
+        turn_count = 0
+        consecutive_failures = 0
+        max_consecutive_failures = 3
+
+        # Optional logging of available tools for verifier
+        if tool_call_log_file and tools:
+            max_name_length = max(
+                len(tool.get("function", {}).get("name", "")) for tool in tools
+            )
+            with open(tool_call_log_file, "a", encoding="utf-8") as f:
+                f.write(f"\n===== Verifier Logs (max_turns: {max_turns}) =====\n")
+
+        while turn_count < max_turns:
+            turn_count += 1
+            # Log turn count
+            logger.info(f"| [Verifier] Turn {turn_count}/{max_turns}")
+            if tool_call_log_file:
+                with open(tool_call_log_file, "a", encoding="utf-8") as f:
+                    f.write(f"[Verifier] Turn {turn_count}/{max_turns}\n")
+            
+            completion_kwargs: Dict[str, Any] = {
+                "model": self.litellm_input_model_name,
+                "messages": messages,
+                "api_key": self.api_key,
+            }
+            if tools:
+                completion_kwargs["tools"] = tools
+                completion_kwargs["tool_choice"] = "auto"
+            if self.base_url:
+                completion_kwargs["base_url"] = self.base_url
+            if self.reasoning_effort != "default":
+                completion_kwargs["reasoning_effort"] = self.reasoning_effort
+
+            try:
+                response = await asyncio.wait_for(
+                    litellm.acompletion(**completion_kwargs),
+                    timeout=self.timeout / 2,
+                )
+                consecutive_failures = 0
+            except asyncio.TimeoutError:
+                logger.warning("| [Verifier] LLM call timed out")
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    raise
+                await asyncio.sleep(2 ** consecutive_failures)
+                continue
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"| [Verifier] LLM call failed: {exc}")
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    raise
+                await asyncio.sleep(2 ** consecutive_failures)
+                continue
+
+            if not self.litellm_run_model_name and getattr(response, "model", None):
+                self.litellm_run_model_name = response.model.split("/")[-1]
+            self._accumulate_usage_from_response(total_tokens, response)
+
+            choices = response.choices
+            if not choices:
+                logger.warning("| [Verifier] Empty choices from LLM")
+                break
+            message = choices[0].message
+            message_dict = message.model_dump() if hasattr(message, "model_dump") else dict(message)
+
+            # Log assistant text (if any)
+            if hasattr(message, "content") and message.content:
+                for line in str(message.content).splitlines():
+                    logger.info(f"| [Verifier] {line}")
+                if tool_call_log_file:
+                    with open(tool_call_log_file, "a", encoding="utf-8") as f:
+                        f.write(f"[Verifier Assistant]\n{message.content}\n")
+
+            # Handle tool calls (read-only inspection)
+            if hasattr(message, "tool_calls") and message.tool_calls:
+                messages.append(message_dict)
+                for tool_call in message.tool_calls:
+                    func_name = tool_call.function.name
+                    try:
+                        func_args = json.loads(tool_call.function.arguments or "{}")
+                    except json.JSONDecodeError:
+                        func_args = {}
+                    args_str = json.dumps(func_args, separators=(",", ": "))
+                    display_args = args_str[:140] + "..." if len(args_str) > 140 else args_str
+                    logger.info(f"| [Verifier] Tool {func_name} {display_args}")
+                    if tool_call_log_file:
+                        with open(tool_call_log_file, "a", encoding="utf-8") as f:
+                            f.write(f"[Verifier ToolCall] {func_name} {args_str}\n")
+                    try:
+                        result = await asyncio.wait_for(
+                            mcp_server.call_tool(func_name, func_args),
+                            timeout=60,
+                        )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": json.dumps(result, ensure_ascii=False),
+                            }
+                        )
+                    except asyncio.TimeoutError:
+                        error_msg = f"Tool '{func_name}' timed out after 60 seconds"
+                        logger.error(f"| [Verifier] {error_msg}")
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": f"Error: {error_msg}",
+                            }
+                        )
+                    except Exception as tool_exc:  # noqa: BLE001
+                        error_msg = f"Tool '{func_name}' failed: {tool_exc}"
+                        logger.error(f"| [Verifier] {error_msg}")
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": f"Error: {error_msg}",
+                            }
+                        )
+                continue
+
+            # No tool calls: treat as final VerificationReport JSON
+            messages.append(message_dict)
+            content_text = getattr(message, "content", "")
+            try:
+                verification_output = self._parse_json_object(str(content_text))
+            except ValueError:
+                # Ask model to reformat as proper JSON
+                logger.warning("| [Verifier] Final response was not valid JSON, requesting correction")
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your previous reply was not valid JSON for VerificationReport. "
+                            "Please respond again with ONLY the VerificationReport JSON object, "
+                            "without code fences or extra text."
+                        ),
+                    }
+                )
+                continue
+
+            if "status" not in verification_output or "summary" not in verification_output:
+                logger.warning("| [Verifier] VerificationReport missing required keys; requesting correction")
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "The VerificationReport must include at least `status` and `summary` keys. "
+                            "Please resend ONLY a valid VerificationReport JSON object."
+                        ),
+                    }
+                )
+                continue
+
+            return verification_output
+
+        raise RuntimeError("Verifier agent failed to produce a valid VerificationReport within turn limit")
+    
+    async def _execute_multi_agent_tool_loop(
+        self,
+        instruction: str,
+        functions: List[Dict[str, Any]],
+        mcp_server: Any,
+        tool_call_log_file: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        High-level multi-agent orchestration following the user-specified design:
+        PlanningAgent (INITIAL/REFINEMENT) → Explorer → Worker loop (placeholder) → Verifier.
+        
+        NOTE: This initial implementation focuses on the planning / verification wiring and
+        uses a lightweight, tool-agnostic EnvironmentSummary. Explorer/Worker currently do
+        not issue real MCP tool calls; they treat the environment as structured hints only.
+        This keeps the architecture modular while avoiding interference with the existing
+        production MDP loop.
+        """
+        # Shared accounting
+        total_tokens: Dict[str, int] = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "reasoning_tokens": 0,
+        }
+        turn_count = 0
+        all_messages: List[Dict[str, Any]] = []
+        
+        # Record initial user message for SDK compatibility
+        all_messages.append({"role": "user", "content": instruction})
+        
+        try:
+            # 1) Explorer first - discover environment
+            environment_summary = await self._run_explorer_agent(
+                task_description=instruction,
+                current_plan=None,
+                functions=functions,
+                mcp_server=mcp_server,
+                total_tokens=total_tokens,
+                tool_call_log_file=tool_call_log_file,
+            )
+            all_messages.append(
+                {
+                    "role": "assistant",
+                    "content": f"[Explorer] {json.dumps(environment_summary, ensure_ascii=False)}",
+                }
+            )
+
+            # Initialize state
+            current_plan: Dict[str, Any] = {"subtasks": []}
+            execution_state: Dict[str, Any] = {
+                "plan": current_plan,
+                "subtasks_progress": [],
+                "artifacts": {},
+                "logs": [],
+            }
+            planning_reason = "initial"
+            verification_loops = 0
+            max_verification_loops = 3
+            final_verification: Optional[Dict[str, Any]] = None
+
+            while True:
+                # Planning (called on first iteration and when re-planning needed)
+                planning_result = await self._run_planning_agent(
+                    task_description=instruction,
+                    current_plan=current_plan,
+                    environment_summary=environment_summary,
+                    execution_state=execution_state,
+                    reason=planning_reason,
+                    available_tools=[f.get("name", "") for f in functions] if functions else [],
+                    total_tokens=total_tokens,
+                    tool_call_log_file=tool_call_log_file,
+                )
+                turn_count += 1
+                current_plan = planning_result.get("plan", {}) or {"subtasks": []}
+                execution_state["plan"] = current_plan
+                planning_notes = planning_result.get("notes", "")
+                execution_state.setdefault("logs", []).append(
+                    f"Planning ({planning_reason}) notes: {planning_notes}"
+                )
+                all_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": f"[PlanningAgent ({planning_reason})] {json.dumps(planning_result, ensure_ascii=False)}",
+                    }
+                )
+
+                # Ensure progress entries exist for all subtasks
+                progress_entries: List[Dict[str, Any]] = execution_state.setdefault(
+                    "subtasks_progress", []
+                )
+                by_id = {entry.get("subtask_id"): entry for entry in progress_entries}
+                for sub in current_plan.get("subtasks", []) or []:
+                    sid = sub.get("id", "")
+                    if sid and sid not in by_id:
+                        entry = {
+                            "subtask_id": sid,
+                            "status": "pending",
+                            "progress_notes": "",
+                        }
+                        progress_entries.append(entry)
+                        by_id[sid] = entry
+
+                # Worker phase for this plan
+                worker_blocked_reason: Optional[str] = None
+                blocked_subtask_id: Optional[str] = None
+
+                for sub in current_plan.get("subtasks", []) or []:
+                    subtask_id = sub.get("id", "")
+                    if not subtask_id:
+                        continue
+
+                    progress_entry = None
+                    for entry in execution_state.get("subtasks_progress", []):
+                        if entry.get("subtask_id") == subtask_id:
+                            progress_entry = entry
+                            break
+                    if progress_entry is None:
+                        progress_entry = {
+                            "subtask_id": subtask_id,
+                            "status": "pending",
+                            "progress_notes": "",
+                        }
+                        execution_state["subtasks_progress"].append(progress_entry)
+
+                    if progress_entry.get("status") == "completed":
+                        continue
+                    logger.info(
+                        "Running Worker on %s | status=%s | description=%s | notes=%s",
+                        subtask_id,
+                        progress_entry.get("status"),
+                        sub.get("description"),
+                        sub.get("notes"),
+                    )
+
+                    progress_entry["status"] = "in_progress"
+                    progress_entry["progress_notes"] = "Worker started."
+
+                    worker_output = await self._run_worker_agent(
+                        task_description=instruction,
+                        environment_summary=environment_summary,
+                        current_subtask=sub,
+                        execution_state=execution_state,
+                        functions=functions,
+                        mcp_server=mcp_server,
+                        total_tokens=total_tokens,
+                        tool_call_log_file=tool_call_log_file,
+                    )
+
+                    status = worker_output.get("status")
+                    if status == "subtask_completed":
+                        summary = worker_output.get("summary", "")
+                        artifacts = worker_output.get("artifacts", {}) or {}
+                        progress_entry["status"] = "completed"
+                        progress_entry["progress_notes"] = (
+                            summary or "Subtask completed by Worker."
+                        )
+                        execution_state.setdefault("artifacts", {}).update(artifacts)
+                        execution_state.setdefault("logs", []).append(
+                            f"Subtask {subtask_id} completed: {summary}"
+                        )
+                    elif status == "subtask_blocked":
+                        reason = worker_output.get(
+                            "reason", "Blocked for unspecified reason."
+                        )
+                        progress_entry["status"] = "blocked"
+                        progress_entry["progress_notes"] = reason
+                        execution_state.setdefault("logs", []).append(
+                            f"Subtask {subtask_id} blocked: {reason}"
+                        )
+                        worker_blocked_reason = reason
+                        blocked_subtask_id = subtask_id
+                        break
+                    else:
+                        progress_entry["status"] = "blocked"
+                        progress_entry[
+                            "progress_notes"
+                        ] = f"Worker returned unexpected status: {status!r}"
+                        execution_state.setdefault("logs", []).append(
+                            f"Worker returned unexpected status for subtask {subtask_id}: {status!r}"
+                        )
+                        worker_blocked_reason = (
+                            f"Unexpected worker status: {status!r}"
+                        )
+                        blocked_subtask_id = subtask_id
+                        break
+
+                if worker_blocked_reason:
+                    planning_reason = (
+                        f"blocked_subtask_{blocked_subtask_id}: {worker_blocked_reason}"
+                    )
+                    continue
+
+                # All subtasks completed → verification
+                verification_report = await self._run_verifier_agent(
+                    task_description=instruction,
+                    environment_summary=environment_summary,
+                    functions=functions,
+                    mcp_server=mcp_server,
+                    total_tokens=total_tokens,
+                    tool_call_log_file=tool_call_log_file,
+                )
+                turn_count += 1
+                verification_loops += 1
+                all_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": f"[Verifier] {json.dumps(verification_report, ensure_ascii=False)}",
+                    }
+                )
+
+                status = verification_report.get("status")
+                if status in ("verified_ok", "pass"):
+                    final_verification = verification_report
+                    break
+
+                if (
+                    status in ("verified_with_issues", "fail", "uncertain")
+                    and verification_loops < max_verification_loops
+                ):
+                    issues = verification_report.get("issues", []) or []
+                    execution_state.setdefault("logs", []).append(
+                        f"Verifier reported issues: {issues}"
+                    )
+                    planning_reason = (
+                        f"verifier_issues: {issues[:2]}"
+                    )
+                    continue
+
+                final_verification = verification_report
+                break
+
+            # 7) Build final natural-language answer
+            status = final_verification.get("status") or ""
+            verdict_summary = final_verification.get("summary", "")
+            issues = final_verification.get("issues", []) or []
+            if status in ("verified_ok", "pass"):
+                final_text = (
+                    "Multi-agent planning completed.\n\n"
+                    f"Plan:\n{json.dumps(execution_state.get('plan'), ensure_ascii=False, indent=2)}\n\n"
+                    f"Verification: {verdict_summary or 'Verifier reported no issues.'}"
+                )
+                success = True
+                error_msg = None
+            elif status in ("verified_with_issues", "fail", "uncertain"):
+                issues_text = "\n".join(f"- {issue}" for issue in issues)
+                final_text = (
+                    "Multi-agent planning completed, but verification reported issues.\n\n"
+                    f"Plan:\n{json.dumps(execution_state.get('plan'), ensure_ascii=False, indent=2)}\n\n"
+                    f"Verification: {verdict_summary}\n\n"
+                    f"Issues:\n{issues_text}"
+                )
+                success = False
+                error_msg = "Verification reported issues in multi-agent planning."
+            else:
+                final_text = (
+                    "Multi-agent planning completed, but verifier status was unrecognized.\n\n"
+                    f"Raw verification report:\n{json.dumps(final_verification, ensure_ascii=False, indent=2)}"
+                )
+                success = False
+                error_msg = "Unexpected verifier status."
+            
+            all_messages.append({"role": "assistant", "content": final_text})
+            sdk_messages = self._convert_to_sdk_format(all_messages)
+            return {
+                "success": success,
+                "output": sdk_messages,
+                "token_usage": total_tokens,
+                "turn_count": turn_count,
+                "error": error_msg,
+                "litellm_run_model_name": self.litellm_run_model_name,
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Multi-agent execution failed: %s", exc, exc_info=True)
+            sdk_messages = self._convert_to_sdk_format(all_messages)
+            return {
+                "success": False,
+                "output": sdk_messages,
+                "token_usage": total_tokens,
+                "turn_count": turn_count,
+                "error": exc,
+                "litellm_run_model_name": self.litellm_run_model_name,
+            }
+    
+    async def _execute_mdp_tool_loop(
+        self,
+        instruction: str,
+        functions: List[Dict],
+        mcp_server: Any,
+        tool_call_log_file: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Execute function calling loop using Markov Decision Process approach.
+        
+        Key differences from other loops:
+        1. Models the whole process as state transitions
+        2. State = {task, evolving report, last actions, last observations}
+        3. Agent generates {report, answer OR tool_calls} each iteration
+        4. Report serves as compressed memory, not accumulating full history
+        """
+        
+        # Convert functions to tools format
+        tools = [{"type": "function", "function": func} for func in functions] if functions else []
+        
+        # MDP State
+        current_report = ""  # Evolving report (compressed memory)
+        last_actions = ""  # Last round's tool calls and results (combined)
+        verification_issues = ""  # Issues from verification agent (if any)
+        
+        # Tracking
+        total_tokens = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "reasoning_tokens": 0}
+        turn_count = 0
+        max_turns = self.MAX_TURNS
+        consecutive_failures = 0
+        max_consecutive_failures = 3
+        hit_turn_limit = False
+        ended_normally = False
+        
+        # Message accumulation for output (backward compatibility)
+        all_messages = []
+        
+        def _record_usage(response_obj):
+            """Accumulate token usage from a LiteLLM response."""
+            if hasattr(response_obj, 'usage') and response_obj.usage:
+                input_tokens = response_obj.usage.prompt_tokens or 0
+                total_tokens_count = response_obj.usage.total_tokens or 0
+                output_tokens = (
+                    total_tokens_count - input_tokens
+                    if total_tokens_count > 0
+                    else (response_obj.usage.completion_tokens or 0)
+                )
+                total_tokens["input_tokens"] += input_tokens
+                total_tokens["output_tokens"] += output_tokens
+                total_tokens["total_tokens"] += total_tokens_count
+                if hasattr(response_obj.usage, 'completion_tokens_details'):
+                    details = response_obj.usage.completion_tokens_details
+                    if hasattr(details, 'reasoning_tokens'):
+                        total_tokens["reasoning_tokens"] += details.reasoning_tokens or 0
+        
+        # Log available tools
+        if tool_call_log_file and tools:
+            max_name_length = max(
+                len(tool.get("function", {}).get("name", ""))
+                for tool in tools
+            )
+            with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                f.write("===== Available Tools =====\n")
+                for tool in tools:
+                    function_info = tool.get("function", {})
+                    tool_name = function_info.get("name", "N/A")
+                    description = function_info.get("description", "N/A")
+                    f.write(f"- ToolName: {tool_name:<{max_name_length}} Description: {description}\n")
+                f.write("\n===== MDP Execution Logs =====\n")
+        
+        logger.info("Starting MDP-based execution loop")
+        
+        try:
+            while turn_count < max_turns:
+                # Build MDP prompt with current state
+                user_prompt = self._build_mdp_prompt(
+                    task=instruction,
+                    tools=tools,
+                    report=current_report,
+                    last_actions=last_actions,
+                    verification_issues=verification_issues
+                )
+                
+                # Build messages (no tools in the API call - we use text-based tool calls)
+                messages = [
+                    {"role": "user", "content": user_prompt}
+                ]
+                
+                # Store system message only once for output
+                if turn_count == 0:
+                    all_messages.append({"role": "user", "content": instruction})
+                
+                # Build completion kwargs
+                completion_kwargs = {
+                    "model": self.litellm_input_model_name,
+                    "messages": messages,
+                    "api_key": self.api_key,
+                }
+                
+                # Add reasoning_effort and base_url if specified
+                if self.reasoning_effort != "default":
+                    completion_kwargs["reasoning_effort"] = self.reasoning_effort
+                if self.base_url:
+                    completion_kwargs["base_url"] = self.base_url
+                
+                try:
+                    # Call LLM
+                    if self._openai_client:
+                        response = await asyncio.wait_for(
+                            self._openai_client.acompletion(
+                                messages=messages,
+                                tools=None,  # No function calling, text-based only
+                                tool_choice=None,
+                            ),
+                            timeout=self.timeout / 2
+                        )
+                    else:
+                        response = await asyncio.wait_for(
+                            litellm.acompletion(**completion_kwargs),
+                            timeout=self.timeout / 2
+                        )
+                    consecutive_failures = 0  # Reset failure counter on success
+                except asyncio.TimeoutError:
+                    logger.warning(f"| ✗ LLM call timed out on turn {turn_count + 1}")
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        raise Exception(f"Too many consecutive failures ({consecutive_failures})")
+                    await asyncio.sleep(8 ** consecutive_failures)
+                    continue
+                except Exception as e:
+                    logger.error(f"| ✗ LLM call failed on turn {turn_count + 1}: {e}")
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        raise
+                    if "ContextWindowExceededError" in str(e):
+                        raise
+                    elif "RateLimitError" in str(e):
+                        await asyncio.sleep(12 ** consecutive_failures)
+                    else:
+                        await asyncio.sleep(2 ** consecutive_failures)
+                    continue
+                
+                # Extract actual model name from response (first turn only)
+                if turn_count == 0 and hasattr(response, 'model') and response.model:
+                    self.litellm_run_model_name = response.model.split("/")[-1]
+                
+                # Update token usage
+                _record_usage(response)
+                
+                # Get response content
+                choices = response.choices
+                if not len(choices):
+                    logger.error("| ✗ No choices in response")
+                    break
+                
+                message = choices[0].message
+                content = message.content if hasattr(message, 'content') else ""
+                
+                if not content:
+                    logger.error("| ✗ Empty content in response")
+                    break
+                
+                # Log the raw response
+                if tool_call_log_file:
+                    with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                        f.write(f"\n===== Turn {turn_count + 1} Response =====\n")
+                        f.write(content + "\n")
+                
+                # Parse MDP response
+                parsed = self._parse_mdp_response(content)
+                
+                if parsed.get("error"):
+                    logger.error(f"| ✗ Failed to parse MDP response: {parsed['error']}")
+                    logger.error(f"| Response content: {content[:500]}...")
+                    logger.warning(f"| ⚠️  Parse error on turn {turn_count + 1}, will retry on next turn")
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        logger.error(f"| ✗ Too many consecutive parse failures ({consecutive_failures})")
+                        break
+                    # Retry by continuing to next iteration (agent will try again)
+                    turn_count += 1
+                    continue
+                
+                # Reset failure counter on successful parse
+                consecutive_failures = 0
+                
+                # Update report
+                new_report = parsed["report"]
+                current_report = new_report
+                logger.info(f"📝 Report updated: {current_report[:200]}{'...' if len(current_report) > 200 else ''}")
+                
+                # Add assistant message to output
+                all_messages.append({
+                    "role": "assistant",
+                    "content": content
+                })
+                
+                # Check if we have an answer (task completed)
+                if parsed.get("answer"):
+                    answer = parsed["answer"]
+                    logger.info(f"✅ Main agent claims task complete: {answer[:200]}{'...' if len(answer) > 200 else ''}")
+                    
+                    if tool_call_log_file:
+                        with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                            f.write(f"| Main Agent Answer: {answer}\n")
+                    
+                    # Run verification before accepting completion
+                    logger.info("🔍 Starting task verification...")
+                    
+                    verification_result = await self._verify_task_completion(
+                        instruction=instruction,
+                        functions=functions,
+                        mcp_server=mcp_server,
+                        tool_call_log_file=tool_call_log_file
+                    )
+                    
+                    if verification_result["passed"]:
+                        logger.info("✅ Task verification PASSED!")
+                        
+                        if tool_call_log_file:
+                            with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                                f.write(f"| ✅ VERIFICATION PASSED\n")
+                        
+                        ended_normally = True
+                        break
+                    else:
+                        issues = verification_result["issues"]
+                        logger.warning(f"❌ Task verification FAILED:\n{issues[:500]}{'...' if len(issues) > 500 else ''}")
+                        
+                        if tool_call_log_file:
+                            with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                                f.write(f"| ❌ VERIFICATION FAILED\n{issues}\n\n")
+                        
+                        verification_issues = issues
+                        last_actions = ""
+                        continue
+                
+                # Execute tool calls
+                tool_calls_list = parsed.get("tool_calls", [])
+                if not tool_calls_list:
+                    logger.warning("| ⚠️  No answer and no tool_calls - treating as completion")
+                    turn_count += 1
+                    ended_normally = True
+                    break
+                
+                logger.info(f"| 🔧 Executing {len(tool_calls_list)} tool call(s)")
+                
+                # Execute each tool call
+                tool_results = []
+                actions_log = []
+                
+                for idx, tool_call_spec in enumerate(tool_calls_list):
+                    func_name = tool_call_spec.get("name")
+                    func_args = tool_call_spec.get("arguments", {})
+                    
+                    if not func_name:
+                        logger.error(f"| ✗ Tool call {idx} missing 'name'")
+                        continue
+                    
+                    # Log tool call
+                    args_str = json.dumps(func_args, separators=(",", ": "))
+                    display_args = args_str[:250] + "..." if len(args_str) > 250 else args_str
+                    logger.info(f"| \033[1m{func_name}\033[0m \033[2;37m{display_args}\033[0m")
+                    
+                    if tool_call_log_file:
+                        with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                            f.write(f"| {func_name} {args_str}\n")
+                    
+                    # Record action for next iteration
+                    actions_log.append(f"{func_name}({args_str})")
+                    
+                    # Execute tool
+                    try:
+                        result = await asyncio.wait_for(
+                            mcp_server.call_tool(func_name, func_args),
+                            timeout=60
+                        )
+                        formatted_result = self._format_tool_result_for_model(result, func_name)
+                        tool_results.append({
+                            "tool": func_name,
+                            "result": formatted_result
+                        })
+                        
+                        
+                    except asyncio.TimeoutError:
+                        error_msg = f"Tool call '{func_name}' timed out after 60 seconds"
+                        logger.error(f"| ✗ {error_msg}")
+                        tool_results.append({
+                            "tool": func_name,
+                            "result": f"Error: {error_msg}"
+                        })
+                    except Exception as e:
+                        logger.error(f"| ✗ Tool call '{func_name}' failed: {e}")
+                        tool_results.append({
+                            "tool": func_name,
+                            "result": f"Error: {str(e)}"
+                        })
+                
+                # Check if compression is needed for MDP (80% threshold)
+                # Since MDP only keeps last turn's data, we can be more lenient
+                # This returns Python objects (list), not JSON string
+                final_results = await self._compress_mdp_observations_if_needed(
+                    tool_results=tool_results,
+                    tool_calls_list=tool_calls_list,
+                    current_report=current_report,
+                    instruction=instruction,
+                    turn_count=turn_count,
+                    tool_call_log_file=tool_call_log_file
+                )
+                
+                # Combine actions and results (work with Python objects)
+                combined_turn_data = []
+                for call, result in zip(tool_calls_list, final_results):
+                    combined_turn_data.append({
+                        "tool": call.get("name"),
+                        "arguments": call.get("arguments", {}),
+                        "result": result.get("result", "")
+                    })
+                
+                # Convert to JSON format for prompt
+                last_actions = json.dumps(combined_turn_data, indent=2)
+                
+                turn_count += 1
+                self._update_progress(all_messages, total_tokens, turn_count)
+            
+        except Exception as loop_error:
+            logger.error(f"MDP loop failed: {loop_error}", exc_info=True)
+            sdk_format_messages = self._convert_to_sdk_format(all_messages)
+            return {
+                "success": False,
+                "output": sdk_format_messages,
+                "token_usage": total_tokens,
+                "turn_count": turn_count,
+                "error": str(loop_error),
+                "litellm_run_model_name": self.litellm_run_model_name,
+            }
+        
+        # Detect if we hit turn limit
+        if (not ended_normally) and (turn_count >= max_turns):
+            hit_turn_limit = True
+            logger.warning(f"| Max turns ({max_turns}) exceeded; returning failure with partial output.")
+            if tool_call_log_file:
+                try:
+                    with open(tool_call_log_file, 'a', encoding='utf-8') as f:
+                        f.write(f"| Max turns ({max_turns}) exceeded\n")
+                except Exception:
+                    pass
+        
+        # Display final token usage
+        if total_tokens["total_tokens"] > 0:
+            log_msg = (
+                f"| Token usage: Total: {total_tokens['total_tokens']:,} | "
+                f"Input: {total_tokens['input_tokens']:,} | "
+                f"Output: {total_tokens['output_tokens']:,}"
+            )
+            if total_tokens.get("reasoning_tokens", 0) > 0:
+                log_msg += f" | Reasoning: {total_tokens['reasoning_tokens']:,}"
+            logger.info(log_msg)
+            logger.info(f"| Turns: {turn_count}")
+        
+        # Convert messages to SDK format for backward compatibility
+        sdk_format_messages = self._convert_to_sdk_format(all_messages)
+        
+        return {
+            "success": not hit_turn_limit,
+            "output": sdk_format_messages,
+            "token_usage": total_tokens,
+            "turn_count": turn_count,
+            "error": (f"Max turns ({max_turns}) exceeded" if hit_turn_limit else None),
+            "litellm_run_model_name": self.litellm_run_model_name
+        }
     

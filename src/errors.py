@@ -15,7 +15,7 @@ from typing import Optional
 RETRYABLE_PATTERNS = {
     "ratelimit",              # e.g., RateLimitError, too many requests
     # "connection",             # connection refused/reset/error
-    "agent execution failed",
+    # "agent execution failed",
     "unavailable",            # service unavailable
     # "execution timed out",    # timeout
     "internal server error",  # 500s
