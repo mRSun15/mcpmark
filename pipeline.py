@@ -5,6 +5,10 @@ MCPMark Unified Evaluation Pipeline
 
 This script provides an automated evaluation pipeline for testing Large Language Models (LLMs)
 on various Multi-Step Cognitive Processes (MCP) services like Notion, GitHub, and PostgreSQL.
+
+Supports two modes:
+1. Standard mode: Run all specified tasks with the base agent
+2. Evolution mode: Run self-evolving agent experiment with Set A/B task split
 """
 
 import argparse
@@ -84,6 +88,13 @@ def main():
         default=Path("./results"),
         help="Directory to save results",
     )
+    
+    # Evolution mode configuration
+    parser.add_argument(
+        "--evolution",
+        action="store_true",
+        help="Enable self-evolving agent experiment mode (filesystem only)",
+    )
 
     # Load arguments and environment variables
     args = parser.parse_args()
@@ -111,6 +122,62 @@ def main():
 
     logger.info("MCPMark Evaluation")
     logger.info(f"Experiment: {args.exp_name} | {len(model_list)} Model(s): {', '.join(model_list)}")
+    
+    # ==================== Evolution Mode ====================
+    if args.evolution:
+        if args.mcp != "filesystem":
+            parser.error("Evolution mode is only supported for filesystem MCP service")
+        
+        logger.info("\n" + "=" * 80)
+        logger.info("EVOLUTION MODE ENABLED")
+        logger.info("=" * 80)
+        
+        from src.evolution.evolution_pipeline import EvolutionPipeline
+        
+        # Run k evolution experiments
+        for run_idx in range(1, args.k + 1):
+            if args.k > 1:
+                logger.info(f"\n{'=' * 80}")
+                logger.info(f"Starting Evolution Run {run_idx}/{args.k}")
+                logger.info(f"{'=' * 80}\n")
+                run_exp_name = f"run-{run_idx}"
+                run_output_dir = args.output_dir / args.exp_name
+            else:
+                run_exp_name = "run-1"
+                run_output_dir = args.output_dir / args.exp_name
+            
+            for model in model_list:
+                logger.info(f"\nRunning evolution experiment for model: {model}")
+                
+                evolution_pipeline = EvolutionPipeline(
+                    mcp_service=args.mcp,
+                    model=model,
+                    timeout=args.timeout,
+                    exp_name=run_exp_name,
+                    output_dir=run_output_dir,
+                    reasoning_effort=args.reasoning_effort,
+                    agent_name=args.agent,
+                )
+                
+                result = evolution_pipeline.run_evolution_experiment()
+                
+                logger.info(f"\n{'=' * 60}")
+                logger.info(f"Evolution Experiment Complete for {model}")
+                logger.info(f"Group 1 (Standard):           {result['group1_standard']['success_rate']:.1%}")
+                logger.info(f"Group 2 (PromptEngineer):     {result['group2_pe']['success_rate']:.1%}")
+                logger.info(f"Group 3 (PE + Feedback):      {result['group3_pe_feedback']['success_rate']:.1%}")
+                logger.info(f"{'=' * 60}")
+        
+        logger.info(f"\n{'=' * 60}")
+        if args.k > 1:
+            logger.info(f"✓ {args.k} evolution runs completed for {len(model_list)} model(s)")
+        else:
+            logger.info(f"✓ Evolution experiment completed for {len(model_list)} model(s)")
+        logger.info(f"Results saved to: {args.output_dir / args.exp_name}")
+        logger.info(f"{'=' * 60}")
+        return
+    
+    # ==================== Standard Mode ====================
     if args.k > 1:
         logger.info(f"Running {args.k} evaluation runs for pass@k metrics")
 

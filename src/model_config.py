@@ -156,7 +156,14 @@ class ModelConfig:
             "provider": "zhipu",
             "api_key_var": "OPENROUTER_API_KEY",
             "litellm_input_model_name": "openrouter/z-ai/glm-4.5",
-        }
+        },
+        # EigenAI models (OpenAI-compatible API)
+        "eigenai-deepseek": {
+            "provider": "eigenai",
+            "api_key_var": "EIGENAI_API_KEY",
+            "base_url_var": "EIGENAI_BASE_URL",
+            "litellm_input_model_name": "deepseek-v31-terminus",
+        },
     }
 
     def __init__(self, model_name: str):
