@@ -15,7 +15,12 @@ import litellm
 import nest_asyncio
 import tiktoken
 
+from pathlib import Path
+
 from src.logger import get_logger
+from src.skills.library import SkillLibrary
+from src.skills.executor import SkillExecutor
+from src.skills.skills_agent import SkillsAgent
 from .base_agent import BaseMCPAgent
 from .mcp import MCPStdioServer, MCPHttpServer, MCPRestClient
 from .openai_client import SimpleOpenAIClient
@@ -202,25 +207,8 @@ class MCPMarkAgent(BaseMCPAgent):
     ACTION_SYSTEM_PROMPT = SYSTEM_PROMPT
     DEFAULT_TIMEOUT = BaseMCPAgent.DEFAULT_TIMEOUT
     
-    # Virtual tool: copy_file (internally does read + write)
-    COPY_FILE_TOOL_SCHEMA = {
-        "name": "copy_file",
-        "description": "Copy a file from source to destination path. Preserves original file. Internally reads source and writes to destination.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "source": {
-                    "type": "string",
-                    "description": "The source file path to copy from"
-                },
-                "destination": {
-                    "type": "string",
-                    "description": "The destination file path to copy to"
-                }
-            },
-            "required": ["source", "destination"]
-        }
-    }
+    # Skills are now loaded dynamically from SkillLibrary
+    # Legacy COPY_FILE_TOOL_SCHEMA removed - use skills/copy_file.json instead
 
     def __init__(
         self,
@@ -285,6 +273,15 @@ class MCPMarkAgent(BaseMCPAgent):
             )
             logger.info(f"Using EigenAI direct client for multi-agent calls: {litellm_input_model_name}")
         
+        # Skills system for composite tool operations
+        self._skill_library = SkillLibrary(storage_path=Path("./skills"))
+        self._skill_executor = None  # Initialized when MCP server is ready
+        self._skills_agent: Optional[SkillsAgent] = None
+        self._skills_agent_enabled: bool = False
+        self._task_proposed_skills: List = []  # Skills proposed for current task
+        self._task_used_skills: set = set()  # Skills actually used in current task
+        logger.info(f"[Skills] Loaded {len(self._skill_library.list_permanent())} permanent skills")
+        
         logger.debug(
             "Initialized MCPMarkAgent for '%s' with model '%s' (Claude: %s, OpenAI Client: %s)",
             mcp_service,
@@ -315,6 +312,82 @@ class MCPMarkAgent(BaseMCPAgent):
         self._prompt_engineer = prompt_engineer
         self._prompt_engineer_enabled = enabled
         logger.info("| [Agent] Prompt Engineer %s", "enabled" if enabled else "disabled")
+    
+    def set_skills_agent(self, skills_agent: SkillsAgent, enabled: bool = True):
+        """
+        Set the Skills Agent for generating task-specific skills.
+        
+        Args:
+            skills_agent: SkillsAgent instance
+            enabled: Whether to enable skills generation (default True)
+        """
+        self._skills_agent = skills_agent
+        self._skills_agent_enabled = enabled
+        logger.info("| [Agent] Skills Agent %s", "enabled" if enabled else "disabled")
+    
+    def get_skill_library(self) -> SkillLibrary:
+        """Get the skill library for external access."""
+        return self._skill_library
+    
+    async def _execute_skill(self, skill_name: str, args: Dict[str, Any], mcp_server) -> Any:
+        """Execute a skill using the skill executor."""
+        skill = self._skill_library.get(skill_name)
+        if not skill:
+            raise ValueError(f"Skill not found: {skill_name}")
+        
+        # Track usage
+        self._task_used_skills.add(skill_name)
+        self._skill_library.increment_usage(skill_name)
+        
+        # Create tool caller that uses MCP server
+        async def tool_caller(tool_name: str, tool_args: Dict) -> Any:
+            return await asyncio.wait_for(
+                mcp_server.call_tool(tool_name, tool_args),
+                timeout=60
+            )
+        
+        # Create LLM caller for skills that need LLM reasoning
+        async def llm_caller(prompt: str, system_prompt: Optional[str] = None) -> str:
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
+            
+            response = await litellm.acompletion(
+                model=self.litellm_input_model_name,
+                messages=messages,
+                api_key=self.api_key,
+                base_url=self.base_url if self.base_url else None,
+                timeout=120,
+            )
+            return response.choices[0].message.content
+        
+        # Initialize executor with callers
+        executor = SkillExecutor(tool_caller=tool_caller, llm_caller=llm_caller)
+        
+        logger.info(f"| [Skills] Executing skill: {skill_name}")
+        result = await executor.execute(skill, args)
+        logger.info(f"| [Skills] Skill {skill_name} completed")
+        
+        return result
+    
+    def _get_skill_tool_definitions(self) -> List[Dict]:
+        """Get all skills as OpenAI function tool definitions."""
+        return self._skill_library.get_tool_definitions()
+    
+    def _finalize_task_skills(self):
+        """After task: promote used skills to permanent, discard unused temporary."""
+        for skill in self._task_proposed_skills:
+            if skill.name in self._task_used_skills:
+                if skill.name not in self._skill_library.list_permanent():
+                    self._skill_library.promote_to_permanent(skill.name)
+                    logger.info(f"| [Skills] Promoted to permanent: {skill.name}")
+            else:
+                self._skill_library.remove_temporary(skill.name)
+                logger.debug(f"| [Skills] Discarded unused: {skill.name}")
+        
+        self._task_proposed_skills = []
+        self._task_used_skills = set()
     
     def _get_base_prompt(self, role: str) -> str:
         """Get the base prompt for a role (evolved or default)."""
@@ -505,6 +578,13 @@ Final JSON formats (no tool_calls in that turn):
             # Refresh service configuration
             self._refresh_service_config()
             
+            # Reset task-specific skill tracking
+            self._task_proposed_skills = []
+            self._task_used_skills = set()
+            self._skill_library.clear_temporary()
+            
+            # SkillsAgent will be called inside _execute_litellm_with_tools after MCP tools are available
+            
             # Execute with timeout control
             async def _execute_with_strategy():
                 if self.use_claude_thinking:
@@ -526,6 +606,10 @@ Final JSON formats (no tool_calls in that turn):
             
             execution_time = time.time() - start_time
             
+            # Finalize skills: promote used skills to permanent, discard unused
+            if self._task_proposed_skills:
+                self._finalize_task_skills()
+            
             # Update usage statistics
             self.usage_tracker.update(
                 success=result["success"],
@@ -535,6 +619,7 @@ Final JSON formats (no tool_calls in that turn):
             )
             
             result["execution_time"] = execution_time
+            result["skills_used"] = list(self._task_used_skills)
             return result
         
         except Exception as e:
@@ -4284,9 +4369,13 @@ Now please begin your deep analytical work."""
         tool_call_log_file: Optional[str],
         task_specific_prompt: Optional[str] = None,
     ) -> Dict[str, Any]:
-        # Add virtual copy_file tool for the worker
+        # Add skills as available tools for the worker
         functions = list(functions)  # Copy to avoid modifying original
-        functions.append(self.COPY_FILE_TOOL_SCHEMA)
+        skill_tools = self._get_skill_tool_definitions()
+        for skill_tool in skill_tools:
+            # Convert to function schema format
+            func_def = skill_tool.get("function", {})
+            functions.append(func_def)
         
         # Priority: task-specific prompt > evolved prompt > default prompt
         if task_specific_prompt:
@@ -4441,27 +4530,9 @@ Now please begin your deep analytical work."""
                         with open(tool_call_log_file, "a", encoding="utf-8") as f:
                             f.write(f"[Worker ToolCall] {func_name} {args_str}\n")
                     try:
-                        # Handle virtual copy_file tool
-                        if func_name == "copy_file":
-                            source = func_args.get("source", "")
-                            destination = func_args.get("destination", "")
-                            # Step 1: Read source file
-                            read_result = await asyncio.wait_for(
-                                mcp_server.call_tool("read_text_file", {"path": source}),
-                                timeout=60
-                            )
-                            # read_text_file returns the file content directly
-                            content = read_result if isinstance(read_result, str) else str(read_result)
-                            # Log preview for debugging
-                            content_len = len(content)
-                            preview = content[:200].replace('\n', ' ') if content else "(empty)"
-                            logger.info(f"| [Worker] 📄 copy_file: {content_len} bytes, preview: {preview}...")
-                            # Step 2: Write to destination
-                            await asyncio.wait_for(
-                                mcp_server.call_tool("write_file", {"path": destination, "content": content}),
-                                timeout=60
-                            )
-                            result = {"status": "copied", "source": source, "destination": destination, "bytes": content_len}
+                        # Handle skills (including copy_file, move_file, etc.)
+                        if self._skill_library.is_skill(func_name):
+                            result = await self._execute_skill(func_name, func_args, mcp_server)
                         else:
                             result = await asyncio.wait_for(
                                 mcp_server.call_tool(func_name, func_args),
@@ -4981,6 +5052,24 @@ Output Format - Once you have enough evidence, respond with a single JSON object
                     "content": f"[Explorer] {json.dumps(environment_summary, ensure_ascii=False)}",
                 }
             )
+            
+            # Run Skills Agent after Explorer (connection warmed up)
+            if self._skills_agent_enabled and self._skills_agent:
+                try:
+                    logger.info("| [Skills] Running SkillsAgent to propose skills")
+                    base_tools = [{"name": f.get("name", ""), "description": f.get("description", "")} for f in functions]
+                    existing_skills = self._skill_library.get_skill_summaries()
+                    proposed = self._skills_agent.propose_skills(
+                        task_description=instruction,
+                        base_tools=base_tools,
+                        existing_skills=existing_skills,
+                    )
+                    self._task_proposed_skills = proposed
+                    for skill in proposed:
+                        self._skill_library.register_temporary(skill)
+                    logger.info(f"| [Skills] Proposed {len(proposed)} skills: {[s.name for s in proposed]}")
+                except Exception as e:
+                    logger.warning(f"| [Skills] SkillsAgent failed: {e}")
 
             # Initialize state
             current_plan: Dict[str, Any] = {"subtasks": []}
@@ -5015,7 +5104,7 @@ Output Format - Once you have enough evidence, respond with a single JSON object
                     environment_summary=environment_summary,
                     execution_state=execution_state,
                     reason=planning_reason,
-                    available_tools=([f.get("name", "") for f in functions] + ["copy_file"]) if functions else ["copy_file"],
+                    available_tools=([f.get("name", "") for f in functions] + self._skill_library.list_all()) if functions else self._skill_library.list_all(),
                     total_tokens=total_tokens,
                     tool_call_log_file=tool_call_log_file,
                     task_specific_prompt=task_specific_planner_prompt,

@@ -21,6 +21,7 @@ from .task_split import EVOLUTION_TASKS
 from .feedback_agent import FeedbackAgent, FailureAnalyzer
 from .prompt_evolver import PromptEvolutionAgent
 from .prompt_engineer import PromptEngineerAgent
+from src.skills.skills_agent import SkillsAgent
 
 logger = get_logger(__name__)
 
@@ -95,6 +96,14 @@ class EvolutionPipeline:
             timeout=timeout // 4,
         )
         
+        self.skills_agent = SkillsAgent(
+            model=self.litellm_input_model_name,
+            api_key=self.api_key,
+            base_url=self.base_url,
+            reasoning_effort=self.reasoning_effort,
+            timeout=timeout // 2,
+        )
+        
         self.agent = None
         self._create_agent()
 
@@ -102,6 +111,7 @@ class EvolutionPipeline:
         self,
         evolved_prompts: Optional[Dict[str, Dict]] = None,
         enable_prompt_engineer: bool = False,
+        enable_skills_agent: bool = False,
         feedback: Optional[Dict[str, Any]] = None,
     ):
         agent_cls = AGENT_REGISTRY[self.agent_name]
@@ -125,6 +135,9 @@ class EvolutionPipeline:
             else:
                 self.prompt_engineer.clear_feedback()
             self.agent.set_prompt_engineer(self.prompt_engineer, enabled=True)
+        
+        if enable_skills_agent:
+            self.agent.set_skills_agent(self.skills_agent, enabled=True)
 
     def _inject_evolved_prompts(self, evolved_prompts: Dict[str, Dict]):
         prompt_texts = {role: ep["evolved_prompt"] for role, ep in evolved_prompts.items()}
@@ -274,7 +287,7 @@ class EvolutionPipeline:
                 }
             else:
                 logger.info(f"[Run] Executing")
-                self._create_agent(enable_prompt_engineer=True, feedback=None)
+                self._create_agent(enable_prompt_engineer=True, enable_skills_agent=True, feedback=None)
                 self.prompt_engineer.clear_generated_prompts()
                 try:
                     task = self._get_task_by_name(task_name)
@@ -294,6 +307,17 @@ class EvolutionPipeline:
                         p.parent.mkdir(parents=True, exist_ok=True)
                         with open(p, "w") as f:
                             json.dump(prompts, f, indent=2)
+                    
+                    # Save skills info (proposed and used)
+                    skill_lib = self.agent.get_skill_library()
+                    skills_info = {
+                        "permanent_skills": skill_lib.list_permanent(),
+                    }
+                    if skills_info["permanent_skills"]:
+                        s = self.base_dir / "run" / task_name / "skills_info.json"
+                        with open(s, "w") as f:
+                            json.dump(skills_info, f, indent=2)
+                    
                     logger.info(f"[Run] {'PASSED' if result.success else 'FAILED'}")
                 except Exception as e:
                     logger.error(f"[Run] Error: {e}")

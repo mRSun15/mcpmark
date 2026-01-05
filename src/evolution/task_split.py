@@ -2,11 +2,11 @@
 Static Task Split for Evolution Experiments
 ============================================
 
-Full task set for evolution experiments.
+Task sets for evolution experiments.
 """
 
-# All filesystem tasks for evolution experiment
-EVOLUTION_TASKS = [
+# Full task set (30 tasks)
+FULL_TASKS = [
     # Hard (6 tasks - 0/4 runs)
     "file_context__duplicates_searching",
     "desktop_template__budget_computation",
@@ -44,10 +44,21 @@ EVOLUTION_TASKS = [
     "votenet__dataset_comparison",
 ]
 
+# Quick test set - tasks likely to use skills (copy/move)
+EVOLUTION_TASKS = [
+    "papers__author_folders",          # Likely: copy/move files to author folders
+    "file_context__file_merging",      # Likely: read multiple + write combined
+]
+
 
 def get_evolution_tasks() -> list[str]:
-    """Get all tasks for the evolution experiment."""
+    """Get tasks for the evolution experiment."""
     return EVOLUTION_TASKS.copy()
+
+
+def get_full_tasks() -> list[str]:
+    """Get all tasks."""
+    return FULL_TASKS.copy()
 
 
 def get_all_evolution_tasks() -> list[str]:
